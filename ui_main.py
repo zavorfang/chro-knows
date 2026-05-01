@@ -1,7 +1,7 @@
 import json
 import os
+import shutil
 import threading
-from datetime import datetime
 
 from PyQt6.QtWidgets import (
     QMainWindow,
@@ -34,6 +34,8 @@ from PyQt6.QtWidgets import (
     QDoubleSpinBox,
     QGroupBox,
     QProgressBar,
+    QSizePolicy,
+    QRadioButton,
 )
 from PyQt6.QtCore import Qt, QTimer, pyqtSignal, QSize, QPointF, QRectF
 from PyQt6.QtGui import (
@@ -53,6 +55,26 @@ from PyQt6.QtGui import (
 from viewer import ViewerWidget
 from timeline import TimelineWidget, OverviewTimelineWidget
 from project import Project
+from wan_chunks import (
+    WAN_CHUNK_SIZE,
+    WAN_OVERLAP_MAX,
+    WAN_OVERLAP_MIN,
+    normalize_chunk_overlap,
+    normalize_wan_chunk_size,
+    plan_wan_chunks,
+)
+from app_utils import (
+    IMAGE_EXPORT_FILTER,
+    IMAGE_EXPORT_FORMATS,
+    build_bookmark_export_filename,
+    build_frame_export_filename,
+    build_recent_file_label,
+    ensure_extension,
+    normalize_image_format,
+    normalize_recent_files,
+    push_recent_file,
+    sanitize_filename_part,
+)
 
 
 class MainWindow(QMainWindow):
@@ -81,6 +103,8 @@ class MainWindow(QMainWindow):
         self.scrub_sensitivity = 5
         self.auto_save_enabled = True
         self.export_folder = ""
+        self.recent_files = []
+        self.recent_files_menu = None
 
         self.load_settings()
 
@@ -269,6 +293,9 @@ class MainWindow(QMainWindow):
         open_video_action.triggered.connect(self.open_video_file)
         file_menu.addAction(open_video_action)
 
+        self.recent_files_menu = file_menu.addMenu("Recent Files")
+        self.refresh_recent_files_menu()
+
         file_menu.addSeparator()
 
         save_action = QAction("Save Project", self)
@@ -288,9 +315,29 @@ class MainWindow(QMainWindow):
         export_action.triggered.connect(self.show_export_dialog)
         file_menu.addAction(export_action)
 
+        export_current_frame_action = QAction("Export Current Frame Image...", self)
+        export_current_frame_action.triggered.connect(self.export_current_frame_image)
+        file_menu.addAction(export_current_frame_action)
+
+        export_first_frame_action = QAction("Export First Frame Image...", self)
+        export_first_frame_action.triggered.connect(self.export_first_frame_image)
+        file_menu.addAction(export_first_frame_action)
+
+        export_last_frame_action = QAction("Export Last Frame Image...", self)
+        export_last_frame_action.triggered.connect(self.export_last_frame_image)
+        file_menu.addAction(export_last_frame_action)
+
+        export_bookmarks_action = QAction("Export Bookmarks as Images...", self)
+        export_bookmarks_action.triggered.connect(self.show_export_bookmarks_dialog)
+        file_menu.addAction(export_bookmarks_action)
+
         export_mp4_action = QAction("Export MP4...", self)
         export_mp4_action.triggered.connect(self.show_export_mp4_dialog)
         file_menu.addAction(export_mp4_action)
+
+        export_wan_action = QAction("Export WAN 2.2 Chunks...", self)
+        export_wan_action.triggered.connect(self.show_export_wan_dialog)
+        file_menu.addAction(export_wan_action)
 
         file_menu.addSeparator()
 
@@ -385,10 +432,117 @@ class MainWindow(QMainWindow):
     def init_bookmark_panel(self):
         self.bookmarks = []
 
+    def get_settings_path(self):
+        return os.path.join(os.path.expanduser("~"), ".kfpro_lite_settings.json")
+
+    def get_default_export_folder(self):
+        if self.export_folder and os.path.isdir(self.export_folder):
+            return self.export_folder
+        if getattr(self.project, "is_video", False) and hasattr(self.project, "video_path"):
+            return os.path.dirname(self.project.video_path)
+        if self.project.folder and os.path.isdir(self.project.folder):
+            return self.project.folder
+        return os.path.expanduser("~")
+
+    def remember_export_folder(self, path):
+        folder = path if os.path.isdir(path) else os.path.dirname(path)
+        if folder:
+            self.export_folder = folder
+            self.save_settings()
+
+    def get_loaded_source_name(self):
+        if getattr(self.project, "is_video", False) and hasattr(self.project, "video_path"):
+            return os.path.splitext(os.path.basename(self.project.video_path))[0]
+        if self.project.folder:
+            return os.path.basename(os.path.normpath(self.project.folder))
+        if self.project.sources:
+            return self.project.sources[0].get("name", self.project.name)
+        return "kfplayer"
+
+    def reset_loaded_media_state(self, clear_bookmarks=True):
+        self.frame_cache = {}
+        self.timeline.thumbnails.clear()
+        self.timeline.bookmarks.clear()
+        self.timeline.set_playhead(0)
+        self.overview_timeline.bookmarks.clear()
+        self.overview_timeline.set_playhead(0)
+        if clear_bookmarks:
+            self.bookmarks = []
+            self.update_bookmark_list()
+
+    def add_recent_file(self, path, kind):
+        self.recent_files = push_recent_file(self.recent_files, path, kind)
+        self.save_settings()
+        self.refresh_recent_files_menu()
+
+    def remove_recent_file(self, path, kind=None):
+        path = os.path.normpath(path)
+        self.recent_files = [
+            entry
+            for entry in self.recent_files
+            if not (
+                entry.get("path", "").lower() == path.lower()
+                and (kind is None or entry.get("kind") == kind)
+            )
+        ]
+        self.save_settings()
+        self.refresh_recent_files_menu()
+
+    def refresh_recent_files_menu(self):
+        if self.recent_files_menu is None:
+            return
+
+        self.recent_files_menu.clear()
+
+        if not self.recent_files:
+            empty_action = QAction("No recent files", self)
+            empty_action.setEnabled(False)
+            self.recent_files_menu.addAction(empty_action)
+            return
+
+        for entry in self.recent_files:
+            action = QAction(build_recent_file_label(entry), self)
+            action.setToolTip(entry["path"])
+            action.triggered.connect(
+                lambda checked=False, recent_entry=entry: self.open_recent_file(
+                    recent_entry
+                )
+            )
+            self.recent_files_menu.addAction(action)
+
+        self.recent_files_menu.addSeparator()
+        clear_action = QAction("Clear History", self)
+        clear_action.triggered.connect(self.clear_recent_files_history)
+        self.recent_files_menu.addAction(clear_action)
+
+    def clear_recent_files_history(self):
+        self.recent_files = []
+        self.save_settings()
+        self.refresh_recent_files_menu()
+
+    def open_recent_file(self, entry):
+        path = entry.get("path", "")
+        kind = entry.get("kind", "video")
+
+        if not path or not os.path.exists(path):
+            QMessageBox.warning(
+                self,
+                "Recent File Missing",
+                f"This recent item is no longer available:\n{path}",
+            )
+            self.remove_recent_file(path, kind)
+            return
+
+        if kind == "project":
+            self.load_project_from_file(path)
+        elif kind == "folder" or os.path.isdir(path):
+            self.project.folder = path
+            self.scan_folder(path)
+        else:
+            self.load_video(path)
+
     def load_settings(self):
-        settings_path = os.path.join(
-            os.path.expanduser("~"), ".kfpro_lite_settings.json"
-        )
+        settings_path = self.get_settings_path()
         if os.path.exists(settings_path):
             try:
                 with open(settings_path, "r") as f:
@@ -399,13 +553,14 @@ class MainWindow(QMainWindow):
                     self.audio_scrub = settings.get("audio_scrub", False)
                     self.scrub_sensitivity = settings.get("scrub_sensitivity", 5)
                     self.auto_save_enabled = settings.get("auto_save", True)
+                    self.recent_files = normalize_recent_files(
+                        settings.get("recent_files", [])
+                    )
             except:
                 pass
 
     def save_settings(self):
-        settings_path = os.path.join(
-            os.path.expanduser("~"), ".kfpro_lite_settings.json"
-        )
+        settings_path = self.get_settings_path()
         settings = {
             "cache_size": self.cache_size_mb,
             "default_fps": self.fps,
@@ -413,6 +568,7 @@ class MainWindow(QMainWindow):
             "audio_scrub": self.audio_scrub,
             "scrub_sensitivity": self.scrub_sensitivity,
             "auto_save": self.auto_save_enabled,
+            "recent_files": self.recent_files,
         }
         with open(settings_path, "w") as f:
             json.dump(settings, f)
@@ -423,18 +579,23 @@ class MainWindow(QMainWindow):
             self.project.folder = folder
             self.scan_folder(folder)
 
-    def scan_folder(self, folder):
+    def scan_folder(self, folder, add_to_recent=True):
         from viewer import detect_sequence
-
-        # Reset video state when loading folder
-        if hasattr(self.project, "is_video"):
-            self.project.is_video = False
-        if hasattr(self.project, "video_path"):
-            delattr(self.project, "video_path")
 
         sequences = detect_sequence(folder)
 
         if sequences:
+            self.reset_loaded_media_state(clear_bookmarks=True)
+            self.project.sources = []
+            self.project.folder = folder
+            self.project.name = os.path.basename(os.path.normpath(folder)) or "Untitled"
+
+            # Reset video state when loading folder
+            if hasattr(self.project, "is_video"):
+                self.project.is_video = False
+            if hasattr(self.project, "video_path"):
+                delattr(self.project, "video_path")
+
             self.project.add_source(folder, sequences[0])
             self.total_frames = len(sequences[0]["files"])
             self.current_frame = 0
@@ -447,10 +608,14 @@ class MainWindow(QMainWindow):
             folder_name = os.path.basename(folder)
             self.setWindowTitle(f"KFPlayer — {folder_name}")
             self.loaded_file_label.setText(folder_name)
+            if add_to_recent:
+                self.add_recent_file(folder, "folder")
+            return True
         else:
             QMessageBox.warning(
                 self, "No Sequences", "No image sequences found in the selected folder."
             )
+            return False
 
     def open_video_file(self):
         """Open a video file using file dialog"""
@@ -502,7 +667,7 @@ class MainWindow(QMainWindow):
                         break
         event.acceptProposedAction()
 
-    def load_video(self, file_path):
+    def load_video(self, file_path, add_to_recent=True):
         """Load a video file and prepare for playback"""
         import cv2
 
@@ -532,7 +697,7 @@ class MainWindow(QMainWindow):
                 QMessageBox.warning(
                     self, "Error", f"Could not open GIF file: {file_path}"
                 )
-                return
+                return False
         else:
             # Regular video handling with OpenCV
             cap = cv2.VideoCapture(file_path)
@@ -540,7 +705,7 @@ class MainWindow(QMainWindow):
                 QMessageBox.warning(
                     self, "Error", f"Could not open video file: {file_path}"
                 )
-                return
+                return False
 
             frame_count = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
             fps = cap.get(cv2.CAP_PROP_FPS)
@@ -548,8 +713,12 @@ class MainWindow(QMainWindow):
             height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
             cap.release()
 
+        self.reset_loaded_media_state(clear_bookmarks=True)
+
         # Clear existing sources when loading a video
         self.project.sources = []
+        self.project.folder = os.path.dirname(file_path)
+        self.project.name = os.path.splitext(os.path.basename(file_path))[0]
 
         # Store video info in project
         self.project.video_path = file_path
@@ -581,6 +750,9 @@ class MainWindow(QMainWindow):
         video_name = os.path.basename(file_path)
         self.setWindowTitle(f"KFPlayer — {video_name}")
         self.loaded_file_label.setText(video_name)
+        if add_to_recent:
+            self.add_recent_file(file_path, "video")
+        return True
 
     def generate_video_thumbnails(self, file_path):
         """Generate thumbnails from video file"""
@@ -872,17 +1044,32 @@ class MainWindow(QMainWindow):
     def show_viewer_context_menu(self, position):
         menu = QMenu(self)
 
-        copy_action = QAction("📋 Copy to Clipboard (Fastest Email Paste)", self)
-        copy_action.setToolTip("Copy the current frame to paste directly into an email")
+        copy_action = QAction("Copy Frame to Clipboard", self)
         copy_action.triggered.connect(self.copy_frame_to_clipboard)
+        copy_action.setEnabled(self.viewer.current_pixmap is not None)
         menu.addAction(copy_action)
 
-        save_action = QAction("📸 Save Frame As... (Best Quality JPG)", self)
-        save_action.setToolTip(
-            "Fast, high-quality save optimized for email attachments"
-        )
-        save_action.triggered.connect(self.save_frame_for_email)
-        menu.addAction(save_action)
+        menu.addSeparator()
+
+        export_current_action = QAction("Export Current Frame...", self)
+        export_current_action.triggered.connect(self.export_current_frame_image)
+        export_current_action.setEnabled(self.total_frames > 0)
+        menu.addAction(export_current_action)
+
+        export_first_action = QAction("Export First Frame...", self)
+        export_first_action.triggered.connect(self.export_first_frame_image)
+        export_first_action.setEnabled(self.total_frames > 0)
+        menu.addAction(export_first_action)
+
+        export_last_action = QAction("Export Last Frame...", self)
+        export_last_action.triggered.connect(self.export_last_frame_image)
+        export_last_action.setEnabled(self.total_frames > 0)
+        menu.addAction(export_last_action)
+
+        export_bookmarks_action = QAction("Export Bookmarks as Images...", self)
+        export_bookmarks_action.triggered.connect(self.show_export_bookmarks_dialog)
+        export_bookmarks_action.setEnabled(bool(self.bookmarks))
+        menu.addAction(export_bookmarks_action)
 
         menu.exec(self.viewer.mapToGlobal(position))
 
@@ -891,41 +1078,305 @@ class MainWindow(QMainWindow):
             return
         clipboard = QApplication.clipboard()
         clipboard.setPixmap(self.viewer.current_pixmap)
-        self.statusBar().showMessage(
-            "✅ Frame copied to clipboard. Ready to paste!", 4000
-        )
+        self.statusBar().showMessage("Frame copied to clipboard.", 4000)
 
-    def save_frame_for_email(self):
-        if not self.viewer.current_pixmap:
+    def export_current_frame_image(self):
+        self.show_export_frame_dialog(self.current_frame, "current")
+
+    def export_first_frame_image(self):
+        if self.total_frames == 0:
+            QMessageBox.warning(self, "Export", "No project loaded.")
+            return
+        self.show_export_frame_dialog(0, "first")
+
+    def export_last_frame_image(self):
+        if self.total_frames == 0:
+            QMessageBox.warning(self, "Export", "No project loaded.")
+            return
+        self.show_export_frame_dialog(self.total_frames - 1, "last")
+
+    def export_selected_bookmark_image(self, item):
+        bookmark_data = item.data(Qt.ItemDataRole.UserRole)
+        if not bookmark_data:
             return
 
-        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        desktop_path = os.path.join(os.path.expanduser("~"), "Desktop")
-        default_name = os.path.join(
-            desktop_path, f"KFPlayer_Frame_{self.current_frame + 1}_{timestamp}.jpg"
-        )
+        label = bookmark_data.get("name") or "bookmark"
+        self.show_export_frame_dialog(bookmark_data["frame"], label)
 
-        filepath, _ = QFileDialog.getSaveFileName(
+    def show_export_frame_dialog(self, frame_num, label):
+        if self.total_frames == 0:
+            QMessageBox.warning(self, "Export", "No project loaded.")
+            return
+
+        default_name = build_frame_export_filename(
+            self.get_loaded_source_name(),
+            frame_num,
+            label,
+            IMAGE_EXPORT_FORMATS["PNG"]["extension"],
+        )
+        default_path = os.path.join(self.get_default_export_folder(), default_name)
+        filepath, selected_filter = QFileDialog.getSaveFileName(
             self,
-            "Save Frame for Email",
-            default_name,
-            "JPEG Image (*.jpg);;PNG Image (*.png)",
+            f"Export Frame {frame_num + 1}",
+            default_path,
+            IMAGE_EXPORT_FILTER,
         )
 
-        if filepath:
-            try:
-                if filepath.lower().endswith(".jpg") or filepath.lower().endswith(
-                    ".jpeg"
-                ):
-                    self.viewer.current_pixmap.save(filepath, "JPG", quality=95)
-                else:
-                    self.viewer.current_pixmap.save(filepath, "PNG", quality=-1)
+        if not filepath:
+            return
 
-                self.statusBar().showMessage(
-                    f"✅ Frame saved successfully: {os.path.basename(filepath)}", 4000
-                )
-            except Exception as e:
-                QMessageBox.warning(self, "Save Error", f"Failed to save image: {e}")
+        format_name = normalize_image_format(filepath, selected_filter)
+        filepath = ensure_extension(
+            filepath, IMAGE_EXPORT_FORMATS[format_name]["extension"]
+        )
+
+        try:
+            saved_paths = self.save_image_export_requests(
+                [{"frame": frame_num, "path": filepath}],
+                format_name,
+                jpeg_quality=95,
+                progress_title=f"Exporting Frame {frame_num + 1}",
+            )
+            self.remember_export_folder(filepath)
+            self.statusBar().showMessage(
+                f"Exported frame {frame_num + 1} to {os.path.basename(saved_paths[0])}.",
+                4000,
+            )
+        except Exception as e:
+            QMessageBox.warning(self, "Export Error", str(e))
+
+    def show_export_bookmarks_dialog(self):
+        if not self.bookmarks:
+            QMessageBox.warning(self, "Export", "No bookmarks available to export.")
+            return
+
+        dialog = ExportBookmarksDialog(self)
+        if dialog.exec() != QDialog.DialogCode.Accepted:
+            return
+
+        output_folder = dialog.output_folder.text().strip()
+        prefix = dialog.filename_prefix.text().strip()
+        format_name = dialog.get_format_name()
+        jpeg_quality = dialog.jpeg_quality.value()
+
+        if not output_folder:
+            QMessageBox.warning(self, "Export", "Please choose an output folder.")
+            return
+
+        self.export_bookmarks_as_images(
+            output_folder,
+            prefix,
+            format_name,
+            jpeg_quality=jpeg_quality,
+        )
+
+    def build_bookmark_export_requests(self, output_folder, prefix, format_name):
+        extension = IMAGE_EXPORT_FORMATS[format_name]["extension"]
+        requests = []
+        for bookmark_index, bookmark in enumerate(
+            sorted(self.bookmarks, key=lambda bm: (bm["frame"], bm.get("name", ""))),
+            start=1,
+        ):
+            filename = build_bookmark_export_filename(
+                prefix,
+                bookmark_index,
+                bookmark["frame"],
+                bookmark.get("name", ""),
+                extension,
+            )
+            requests.append(
+                {
+                    "frame": bookmark["frame"],
+                    "path": os.path.join(output_folder, filename),
+                }
+            )
+        return requests
+
+    def export_bookmarks_as_images(
+        self, output_folder, prefix, format_name="PNG", jpeg_quality=95
+    ):
+        requests = self.build_bookmark_export_requests(
+            output_folder, prefix or self.get_loaded_source_name(), format_name
+        )
+        if not requests:
+            QMessageBox.warning(self, "Export", "No bookmarks available to export.")
+            return
+
+        try:
+            saved_paths = self.save_image_export_requests(
+                requests,
+                format_name,
+                jpeg_quality=jpeg_quality,
+                progress_title="Exporting Bookmark Images",
+            )
+            self.remember_export_folder(output_folder)
+            QMessageBox.information(
+                self,
+                "Export Complete",
+                f"Exported {len(saved_paths)} bookmark image(s) to {output_folder}",
+            )
+        except Exception as e:
+            QMessageBox.critical(self, "Export Error", str(e))
+
+    def save_image_export_requests(
+        self, requests, format_name, jpeg_quality=95, progress_title="Exporting Images"
+    ):
+        import cv2
+        import numpy as np
+        from PIL import Image
+
+        if not requests:
+            return []
+
+        if format_name not in IMAGE_EXPORT_FORMATS:
+            raise ValueError(f"Unsupported image format: {format_name}")
+
+        sorted_requests = sorted(requests, key=lambda request: request["frame"])
+
+        progress = QDialog(self)
+        progress.setWindowTitle(progress_title)
+        progress.setFixedSize(420, 130)
+        prog_layout = QVBoxLayout(progress)
+        status_label = QLabel()
+        status_label.setWordWrap(True)
+        prog_layout.addWidget(status_label)
+        bar = QProgressBar()
+        bar.setRange(0, len(sorted_requests))
+        prog_layout.addWidget(bar)
+        progress.show()
+
+        saved_paths = []
+
+        try:
+            for request in sorted_requests:
+                os.makedirs(os.path.dirname(request["path"]), exist_ok=True)
+
+            if getattr(self.project, "is_video", False) and hasattr(
+                self.project, "video_path"
+            ):
+                video_path = self.project.video_path
+                ext = os.path.splitext(video_path)[1].lower()
+
+                if ext == ".gif":
+                    gif = Image.open(video_path)
+                    try:
+                        for output_index, request in enumerate(sorted_requests, start=1):
+                            status_label.setText(
+                                f"Exporting frame {request['frame'] + 1} ({output_index}/{len(sorted_requests)})"
+                            )
+                            QApplication.processEvents()
+
+                            gif.seek(request["frame"])
+                            frame_rgb = np.array(gif.convert("RGB"))
+                            self.write_rgb_image_file(
+                                frame_rgb,
+                                request["path"],
+                                format_name,
+                                jpeg_quality,
+                            )
+
+                            saved_paths.append(request["path"])
+                            bar.setValue(output_index)
+                            QApplication.processEvents()
+                    finally:
+                        gif.close()
+                else:
+                    cap = cv2.VideoCapture(video_path)
+                    if not cap.isOpened():
+                        raise ValueError(f"Could not open video for export: {video_path}")
+
+                    try:
+                        for output_index, request in enumerate(sorted_requests, start=1):
+                            status_label.setText(
+                                f"Exporting frame {request['frame'] + 1} ({output_index}/{len(sorted_requests)})"
+                            )
+                            QApplication.processEvents()
+
+                            cap.set(cv2.CAP_PROP_POS_FRAMES, request["frame"])
+                            ret, frame = cap.read()
+                            if not ret:
+                                raise ValueError(
+                                    f"Could not read frame {request['frame']} for export."
+                                )
+
+                            frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+                            self.write_rgb_image_file(
+                                frame_rgb,
+                                request["path"],
+                                format_name,
+                                jpeg_quality,
+                            )
+
+                            saved_paths.append(request["path"])
+                            bar.setValue(output_index)
+                            QApplication.processEvents()
+                    finally:
+                        cap.release()
+            else:
+                for output_index, request in enumerate(sorted_requests, start=1):
+                    status_label.setText(
+                        f"Exporting frame {request['frame'] + 1} ({output_index}/{len(sorted_requests)})"
+                    )
+                    QApplication.processEvents()
+
+                    source_frame_path = self.get_sequence_frame_path(request["frame"])
+                    if source_frame_path and self.can_copy_source_frame(
+                        source_frame_path, format_name
+                    ):
+                        shutil.copy2(source_frame_path, request["path"])
+                    else:
+                        pixmap = self.load_frame_data(request["frame"])
+                        if pixmap is None:
+                            raise ValueError(
+                                f"Could not load frame {request['frame']} for export."
+                            )
+                        self.write_pixmap_image_file(
+                            pixmap,
+                            request["path"],
+                            format_name,
+                            jpeg_quality,
+                        )
+
+                    saved_paths.append(request["path"])
+                    bar.setValue(output_index)
+                    QApplication.processEvents()
+        finally:
+            progress.close()
+
+        return saved_paths
+
+    def get_sequence_frame_path(self, frame_num):
+        if not self.project.sources:
+            return None
+
+        source = self.project.sources[0]
+        files = source.get("files", [])
+        if 0 <= frame_num < len(files):
+            return files[frame_num]
+        return None
+
+    def can_copy_source_frame(self, source_path, format_name):
+        source_extension = os.path.splitext(source_path)[1].lower()
+        return source_extension in IMAGE_EXPORT_FORMATS[format_name]["extensions"]
+
+    def write_rgb_image_file(self, frame_rgb, filepath, format_name, jpeg_quality=95):
+        import cv2
+
+        frame_bgr = cv2.cvtColor(frame_rgb, cv2.COLOR_RGB2BGR)
+        params = []
+        if format_name == "JPEG":
+            params = [cv2.IMWRITE_JPEG_QUALITY, int(jpeg_quality)]
+        elif format_name == "PNG":
+            params = [cv2.IMWRITE_PNG_COMPRESSION, 1]
+
+        if not cv2.imwrite(filepath, frame_bgr, params):
+            raise ValueError(f"Failed to save image: {filepath}")
+
+    def write_pixmap_image_file(self, pixmap, filepath, format_name, jpeg_quality=95):
+        quality = int(jpeg_quality) if format_name == "JPEG" else -1
+        qt_format = IMAGE_EXPORT_FORMATS[format_name]["qt_format"]
+        if not pixmap.save(filepath, qt_format, quality):
+            raise ValueError(f"Failed to save image: {filepath}")
 
     def on_viewer_click(self, frame_num):
         self.seek_to_frame(frame_num)
@@ -966,6 +1417,18 @@ class MainWindow(QMainWindow):
         item = self.bookmark_list.itemAt(position)
         if item:
             menu = QMenu()
+            export_action = QAction("Export Bookmark Image...", self)
+            export_action.triggered.connect(
+                lambda: self.export_selected_bookmark_image(item)
+            )
+            menu.addAction(export_action)
+
+            export_all_action = QAction("Export All Bookmarks as Images...", self)
+            export_all_action.triggered.connect(self.show_export_bookmarks_dialog)
+            export_all_action.setEnabled(bool(self.bookmarks))
+            menu.addAction(export_all_action)
+
+            menu.addSeparator()
             delete_action = QAction("Delete Bookmark", self)
             delete_action.triggered.connect(lambda: self.delete_bookmark(item))
             menu.addAction(delete_action)
@@ -1044,7 +1507,7 @@ class MainWindow(QMainWindow):
 
                 if os.path.exists(folder):
                     self.project.folder = folder
-                    self.scan_folder(folder)
+                    self.scan_folder(folder, add_to_recent=False)
 
                     if "timeline" in project_data:
                         self.current_frame = project_data["timeline"].get("current", 0)
@@ -1055,6 +1518,7 @@ class MainWindow(QMainWindow):
                         self.update_bookmark_list()
                         for bm in self.bookmarks:
                             self.timeline.add_bookmark(bm["frame"])
+                            self.overview_timeline.add_bookmark(bm["frame"])
 
                     if "view" in project_data:
                         view = project_data["view"]
@@ -1070,6 +1534,7 @@ class MainWindow(QMainWindow):
                         self.fps_label.setText(f"{self.fps} FPS")
                         self.loop_btn.setChecked(self.loop_enabled)
 
+            self.add_recent_file(filepath, "project")
             self.status_bar.showMessage(f"Project loaded from {filepath}", 3000)
 
         except Exception as e:
@@ -1110,10 +1575,88 @@ class MainWindow(QMainWindow):
             if filepath:
                 self.export_mp4(filepath, start_frame, end_frame, quality, preset)
 
-    def export_mp4(self, filepath, start_frame, end_frame, quality, preset="fast"):
-        import imageio
+    def show_export_wan_dialog(self):
+        if self.total_frames == 0:
+            QMessageBox.warning(self, "Export", "No project loaded.")
+            return
+
+        dialog = ExportWanChunksDialog(self)
+        if dialog.exec() == QDialog.DialogCode.Accepted:
+            output_folder = dialog.output_folder.text().strip()
+            prefix = dialog.filename_prefix.text().strip()
+            chunk_size = dialog.get_chunk_size()
+            overlap = dialog.get_overlap()
+            quality = dialog.quality_slider.value()
+            preset = dialog.speed_combo.currentText()
+
+            if not output_folder:
+                QMessageBox.warning(self, "Export", "Please choose an output folder.")
+                return
+
+            self.export_wan_chunks(
+                output_folder, prefix, chunk_size, overlap, quality, preset
+            )
+
+    def get_export_fps(self):
+        fps = (
+            self.project.video_fps
+            if getattr(self.project, "is_video", False)
+            and hasattr(self.project, "video_fps")
+            else self.fps
+        )
+        return int(fps) if fps > 0 else 24
+
+    def quality_to_crf(self, quality):
+        return int(35 - ((quality - 1) * (20 / 9)))
+
+    def pixmap_to_rgb_array(self, pixmap):
         import numpy as np
 
+        img = pixmap.toImage()
+        img = img.convertToFormat(QImage.Format.Format_RGB888)
+
+        ptr = img.bits()
+        ptr.setsize(img.sizeInBytes())
+
+        height = img.height()
+        width = img.width()
+        arr = np.array(ptr).reshape((height, img.bytesPerLine()))
+        return arr[:, : width * 3].reshape((height, width, 3))
+
+    def write_mp4_file(
+        self, filepath, frame_numbers, quality, preset="fast", progress_callback=None
+    ):
+        import imageio
+
+        if not filepath.endswith(".mp4"):
+            filepath += ".mp4"
+
+        writer = imageio.get_writer(
+            filepath,
+            format="FFMPEG",
+            mode="I",
+            fps=self.get_export_fps(),
+            codec="libx264",
+            macro_block_size=None,
+            quality=None,
+            output_params=["-crf", str(self.quality_to_crf(quality)), "-preset", preset],
+        )
+
+        try:
+            total = len(frame_numbers)
+            for output_index, source_frame in enumerate(frame_numbers, start=1):
+                pixmap = self.load_frame_data(source_frame)
+                if pixmap is None:
+                    raise ValueError(f"Could not load frame {source_frame} for export.")
+
+                writer.append_data(self.pixmap_to_rgb_array(pixmap))
+
+                if progress_callback:
+                    progress_callback(output_index, total, source_frame)
+        finally:
+            writer.close()
+
+    def export_mp4(self, filepath, start_frame, end_frame, quality, preset="fast"):
         if not filepath.endswith(".mp4"):
             filepath += ".mp4"
 
@@ -1127,53 +1670,106 @@ class MainWindow(QMainWindow):
         progress.show()
 
         try:
-            fps = (
-                self.project.video_fps
-                if getattr(self.project, "is_video", False)
-                and hasattr(self.project, "video_fps")
-                else self.fps
-            )
-            fps = int(fps) if fps > 0 else 24
+            frame_numbers = list(range(start_frame, end_frame + 1))
 
-            # Map simple 1-10 quality to FFMPEG CRF range (roughly 35 to 15, lower is better quality/bigger file)
-            # FFMPEG H264 defaults to about 23.
-            crf = int(35 - ((quality - 1) * (20 / 9)))
-
-            writer = imageio.get_writer(
-                filepath,
-                format="FFMPEG",
-                mode="I",
-                fps=fps,
-                codec="libx264",
-                macro_block_size=None,
-                quality=None,
-                output_params=["-crf", str(crf), "-preset", preset],
-            )
-
-            for f in range(start_frame, end_frame + 1):
-                pixmap = self.load_frame_data(f)
-                if pixmap:
-                    img = pixmap.toImage()
-                    img = img.convertToFormat(QImage.Format.Format_RGB888)
-
-                    ptr = img.bits()
-                    ptr.setsize(img.sizeInBytes())
-
-                    height = img.height()
-                    width = img.width()
-                    arr = np.array(ptr).reshape((height, img.bytesPerLine()))
-                    arr = arr[:, : width * 3].reshape((height, width, 3))
-
-                    writer.append_data(arr)
-
-                bar.setValue(f)
+            def update_progress(output_index, total, source_frame):
+                bar.setValue(start_frame + output_index - 1)
                 QApplication.processEvents()
 
-            writer.close()
+            self.write_mp4_file(
+                filepath,
+                frame_numbers,
+                quality,
+                preset,
+                progress_callback=update_progress,
+            )
+
+            bar.setValue(end_frame)
+            QApplication.processEvents()
+
             QMessageBox.information(
                 self,
                 "Export Complete",
                 f"Successfully exported frames {start_frame}-{end_frame}",
+            )
+        except Exception as e:
+            QMessageBox.critical(self, "Export Error", str(e))
+        finally:
+            progress.close()
+
+    def export_wan_chunks(
+        self, output_folder, prefix, chunk_size, overlap, quality, preset="fast"
+    ):
+        chunk_size = normalize_wan_chunk_size(chunk_size)
+        overlap = normalize_chunk_overlap(overlap, chunk_size)
+        chunk_plan = plan_wan_chunks(self.total_frames, chunk_size, overlap)
+        if not chunk_plan:
+            QMessageBox.warning(self, "Export", "No frames available for export.")
+            return
+
+        prefix = sanitize_filename_part(prefix)
+        total_output_frames = sum(chunk.target_length for chunk in chunk_plan)
+
+        progress = QDialog(self)
+        progress.setWindowTitle("Exporting WAN 2.2 Chunks...")
+        progress.setFixedSize(420, 130)
+        prog_layout = QVBoxLayout(progress)
+        status_label = QLabel()
+        status_label.setWordWrap(True)
+        prog_layout.addWidget(status_label)
+        bar = QProgressBar()
+        bar.setRange(0, total_output_frames)
+        prog_layout.addWidget(bar)
+        progress.show()
+
+        completed_frames = 0
+
+        try:
+            os.makedirs(output_folder, exist_ok=True)
+
+            for chunk_index, chunk in enumerate(chunk_plan, start=1):
+                filename = (
+                    f"{prefix}_wan22_{chunk_index:03d}_"
+                    f"{chunk.target_length:03d}f_"
+                    f"{chunk.start_frame:04d}-{chunk.end_frame:04d}.mp4"
+                )
+                filepath = os.path.join(output_folder, filename)
+
+                frame_numbers = list(range(chunk.start_frame, chunk.end_frame + 1))
+                if chunk.pad_count > 0:
+                    frame_numbers.extend([chunk.end_frame] * chunk.pad_count)
+
+                status_label.setText(
+                    f"Chunk {chunk_index}/{len(chunk_plan)}: "
+                    f"frames {chunk.start_frame}-{chunk.end_frame} "
+                    f"-> {chunk.target_length} WAN-safe frames"
+                )
+                QApplication.processEvents()
+
+                def update_progress(output_index, total, source_frame, base=completed_frames):
+                    bar.setValue(base + output_index)
+                    QApplication.processEvents()
+
+                self.write_mp4_file(
+                    filepath,
+                    frame_numbers,
+                    quality,
+                    preset,
+                    progress_callback=update_progress,
+                )
+
+                completed_frames += len(frame_numbers)
+
+            bar.setValue(total_output_frames)
+            QApplication.processEvents()
+
+            QMessageBox.information(
+                self,
+                "Export Complete",
+                f"Exported {len(chunk_plan)} WAN 2.2 chunk(s) "
+                f"using a {chunk_size}-frame chunk size"
+                f"{f' with {overlap}-frame overlap' if overlap else ''} "
+                f"to {output_folder}",
             )
         except Exception as e:
             QMessageBox.critical(self, "Export Error", str(e))
@@ -1305,7 +1901,7 @@ class ExportDialog(QDialog):
         layout.addRow(export_type_group)
 
         self.format_combo = QComboBox()
-        self.format_combo.addItems(["PNG", "JPEG", "TIFF", "EXR"])
+        self.format_combo.addItems(list(IMAGE_EXPORT_FORMATS.keys()))
         layout.addRow("Format:", self.format_combo)
 
         self.quality_slider = QSlider(Qt.Orientation.Horizontal)
@@ -1313,9 +1909,7 @@ class ExportDialog(QDialog):
         self.quality_slider.setValue(90)
         layout.addRow("JPEG Quality:", self.quality_slider)
 
-        self.output_folder = QLineEdit(
-            parent.export_folder if parent.export_folder else ""
-        )
+        self.output_folder = QLineEdit(parent.get_default_export_folder())
         folder_layout = QHBoxLayout()
         folder_layout.addWidget(self.output_folder)
         browse_btn = QPushButton("...")
@@ -1366,25 +1960,105 @@ class ExportDialog(QDialog):
             return
 
         parent = self.parent()
-        format_ext = self.format_combo.currentText().lower()
+        format_name = self.format_combo.currentText()
+        format_ext = IMAGE_EXPORT_FORMATS[format_name]["extension"]
 
         if self.export_mode == "single":
-            frame = parent.load_frame_data(parent.current_frame)
-            if frame:
-                filename = self.filename_pattern.text().replace(
-                    "####", f"{parent.current_frame:04d}"
+            filename = self.filename_pattern.text().replace(
+                "####", f"{parent.current_frame + 1:04d}"
+            )
+            filepath = os.path.join(self.output_folder.text(), filename)
+            filepath = ensure_extension(filepath, format_ext)
+
+            try:
+                parent.save_image_export_requests(
+                    [{"frame": parent.current_frame, "path": filepath}],
+                    format_name,
+                    jpeg_quality=self.quality_slider.value(),
+                    progress_title=f"Exporting Frame {parent.current_frame + 1}",
                 )
-                filepath = os.path.join(self.output_folder.text(), filename)
-                frame.save(filepath)
+                parent.remember_export_folder(filepath)
                 QMessageBox.information(
                     self, "Export Complete", f"Frame exported to {filepath}"
                 )
+            except Exception as e:
+                QMessageBox.critical(self, "Export Error", str(e))
+                return
         else:
             QMessageBox.information(
                 self, "Export Complete", "Sequence export functionality coming soon!"
             )
 
         self.accept()
+
+
+class ExportBookmarksDialog(QDialog):
+    def __init__(self, parent):
+        super().__init__(parent)
+        self.setWindowTitle("Export Bookmarks as Images")
+        self.setModal(True)
+        self.setMinimumWidth(380)
+
+        layout = QFormLayout(self)
+
+        info = QLabel(
+            f"{len(parent.bookmarks)} bookmark(s) will export at source resolution."
+        )
+        info.setWordWrap(True)
+        layout.addRow(info)
+
+        self.output_folder = QLineEdit(parent.get_default_export_folder())
+        folder_layout = QHBoxLayout()
+        folder_layout.addWidget(self.output_folder)
+        browse_btn = QPushButton("...")
+        browse_btn.setFixedWidth(30)
+        browse_btn.clicked.connect(self.browse_output_folder)
+        folder_layout.addWidget(browse_btn)
+        layout.addRow("Output Folder:", folder_layout)
+
+        self.filename_prefix = QLineEdit(parent.get_loaded_source_name())
+        layout.addRow("Filename Prefix:", self.filename_prefix)
+
+        self.format_combo = QComboBox()
+        self.format_combo.addItems(list(IMAGE_EXPORT_FORMATS.keys()))
+        self.format_combo.currentTextChanged.connect(self.update_quality_state)
+        layout.addRow("Format:", self.format_combo)
+
+        self.jpeg_quality = QSlider(Qt.Orientation.Horizontal)
+        self.jpeg_quality.setRange(80, 100)
+        self.jpeg_quality.setValue(95)
+        self.jpeg_quality_label = QLabel("JPEG Quality: 95")
+        self.jpeg_quality.valueChanged.connect(self.update_quality_label)
+
+        quality_layout = QVBoxLayout()
+        quality_layout.addWidget(self.jpeg_quality_label)
+        quality_layout.addWidget(self.jpeg_quality)
+        layout.addRow("JPEG:", quality_layout)
+
+        buttons = QDialogButtonBox(
+            QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel
+        )
+        buttons.accepted.connect(self.accept)
+        buttons.rejected.connect(self.reject)
+        layout.addRow(buttons)
+
+        self.update_quality_state(self.format_combo.currentText())
+
+    def browse_output_folder(self):
+        folder = QFileDialog.getExistingDirectory(self, "Select Output Folder")
+        if folder:
+            self.output_folder.setText(folder)
+
+    def get_format_name(self):
+        return self.format_combo.currentText()
+
+    def update_quality_label(self, value):
+        self.jpeg_quality_label.setText(f"JPEG Quality: {value}")
+
+    def update_quality_state(self, format_name):
+        is_jpeg = format_name == "JPEG"
+        self.jpeg_quality.setEnabled(is_jpeg)
+        self.jpeg_quality_label.setEnabled(is_jpeg)
 
 
 class ExportMp4Dialog(QDialog):
@@ -1455,4 +2129,191 @@ class ExportMp4Dialog(QDialog):
         self.quality_label.setText(f"Quality: {val} ({desc})")
 
 
-from PyQt6.QtWidgets import QSizePolicy, QRadioButton
+class ExportWanChunksDialog(QDialog):
+    def __init__(self, parent):
+        super().__init__(parent)
+        self.parent_window = parent
+        self.setWindowTitle("Export WAN 2.2 Chunks")
+        self.setModal(True)
+        self.setMinimumWidth(380)
+
+        layout = QFormLayout(self)
+        self.plan_info = QLabel()
+        self.plan_info.setWordWrap(True)
+        layout.addRow(self.plan_info)
+
+        if parent.export_folder:
+            default_output_folder = parent.export_folder
+        elif getattr(parent.project, "is_video", False) and hasattr(parent.project, "video_path"):
+            default_output_folder = os.path.dirname(parent.project.video_path)
+        else:
+            default_output_folder = parent.project.folder
+
+        self.output_folder = QLineEdit(default_output_folder)
+        folder_layout = QHBoxLayout()
+        folder_layout.addWidget(self.output_folder)
+        browse_btn = QPushButton("...")
+        browse_btn.setFixedWidth(30)
+        browse_btn.clicked.connect(self.browse_output_folder)
+        folder_layout.addWidget(browse_btn)
+        layout.addRow("Output Folder:", folder_layout)
+
+        if getattr(parent.project, "is_video", False) and hasattr(
+            parent.project, "video_path"
+        ):
+            default_name = os.path.splitext(os.path.basename(parent.project.video_path))[0]
+        else:
+            default_name = parent.project.name
+        self.filename_prefix = QLineEdit(sanitize_filename_part(default_name))
+        layout.addRow("Filename Prefix:", self.filename_prefix)
+
+        self.chunk_size_spinbox = QSpinBox()
+        self.chunk_size_spinbox.setRange(1, 10000)
+        self.chunk_size_spinbox.setValue(WAN_CHUNK_SIZE)
+        self.chunk_size_spinbox.valueChanged.connect(self.update_chunk_preview)
+        layout.addRow("Chunk Size:", self.chunk_size_spinbox)
+
+        self.overlap_checkbox = QCheckBox("Enable overlap")
+        self.overlap_checkbox.toggled.connect(self.update_overlap_state)
+        self.overlap_spinbox = QSpinBox()
+        self.overlap_spinbox.setRange(WAN_OVERLAP_MIN, WAN_OVERLAP_MAX)
+        self.overlap_spinbox.setValue(8)
+        self.overlap_spinbox.setEnabled(False)
+        self.overlap_spinbox.valueChanged.connect(self.update_chunk_preview)
+
+        overlap_layout = QHBoxLayout()
+        overlap_layout.addWidget(self.overlap_checkbox)
+        overlap_layout.addWidget(self.overlap_spinbox)
+        overlap_layout.addWidget(QLabel("frames"))
+        overlap_layout.addStretch()
+        layout.addRow("Overlap:", overlap_layout)
+
+        self.chunk_label = QLabel()
+        self.chunk_label.setWordWrap(True)
+        layout.addRow("Chunk Rule:", self.chunk_label)
+
+        self.quality_slider = QSlider(Qt.Orientation.Horizontal)
+        self.quality_slider.setRange(1, 10)
+        self.quality_slider.setValue(5)
+        self.quality_slider.setTickPosition(QSlider.TickPosition.TicksBelow)
+        self.quality_slider.setTickInterval(1)
+
+        self.quality_label = QLabel("Quality: 5 (Balanced)")
+        self.quality_slider.valueChanged.connect(self.update_quality_label)
+
+        quality_layout = QVBoxLayout()
+        quality_layout.addWidget(self.quality_label)
+        quality_layout.addWidget(self.quality_slider)
+        layout.addRow("Compression:", quality_layout)
+
+        self.speed_combo = QComboBox()
+        self.speed_combo.addItems(["ultrafast", "fast", "medium", "slow"])
+        self.speed_combo.setCurrentIndex(1)
+        layout.addRow("Speed:", self.speed_combo)
+
+        padding_hint = QLabel(
+            "Short clips are padded by repeating the last frame until they land on a WAN 2.2-safe length."
+        )
+        padding_hint.setWordWrap(True)
+        padding_hint.setStyleSheet("color: gray; font-size: 10px;")
+        layout.addRow(padding_hint)
+
+        buttons = QDialogButtonBox(
+            QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel
+        )
+        buttons.accepted.connect(self.accept)
+        buttons.rejected.connect(self.reject)
+        layout.addRow(buttons)
+
+        self.update_chunk_preview()
+
+    def get_chunk_size(self):
+        return normalize_wan_chunk_size(self.chunk_size_spinbox.value())
+
+    def get_overlap(self):
+        if not self.overlap_checkbox.isChecked():
+            return 0
+        return normalize_chunk_overlap(
+            self.overlap_spinbox.value(), self.get_chunk_size()
+        )
+
+    def browse_output_folder(self):
+        folder = QFileDialog.getExistingDirectory(self, "Select Output Folder")
+        if folder:
+            self.output_folder.setText(folder)
+
+    def update_overlap_state(self, checked=False):
+        self.overlap_spinbox.setEnabled(self.overlap_checkbox.isChecked())
+        self.update_chunk_preview()
+
+    def update_chunk_preview(self, *_args):
+        requested_chunk_size = self.chunk_size_spinbox.value()
+        snapped_chunk_size = normalize_wan_chunk_size(requested_chunk_size)
+
+        max_overlap = min(WAN_OVERLAP_MAX, snapped_chunk_size - 1)
+        overlap_available = max_overlap >= WAN_OVERLAP_MIN
+
+        self.overlap_checkbox.setEnabled(overlap_available)
+        if overlap_available:
+            self.overlap_spinbox.setRange(WAN_OVERLAP_MIN, max_overlap)
+            if self.overlap_spinbox.value() > max_overlap:
+                self.overlap_spinbox.setValue(max_overlap)
+        else:
+            self.overlap_spinbox.setEnabled(False)
+            if self.overlap_checkbox.isChecked():
+                self.overlap_checkbox.blockSignals(True)
+                self.overlap_checkbox.setChecked(False)
+                self.overlap_checkbox.blockSignals(False)
+
+        overlap = self.get_overlap()
+        self.overlap_spinbox.setEnabled(
+            overlap_available and self.overlap_checkbox.isChecked()
+        )
+        plans = plan_wan_chunks(self.parent_window.total_frames, snapped_chunk_size, overlap)
+
+        target_lengths = [str(chunk.target_length) for chunk in plans]
+        target_preview = ", ".join(target_lengths[:6])
+        if len(target_lengths) > 6:
+            target_preview += ", ..."
+
+        raw_lengths = [
+            str(chunk.source_length)
+            if chunk.pad_count == 0
+            else f"{chunk.source_length}->{chunk.target_length}"
+            for chunk in plans
+        ]
+        raw_preview = ", ".join(raw_lengths[:6])
+        if len(raw_lengths) > 6:
+            raw_preview += ", ..."
+
+        self.plan_info.setText(
+            f"{self.parent_window.total_frames} source frames will export as "
+            f"{len(plans)} WAN-safe clip(s): {target_preview}"
+        )
+
+        overlap_text = (
+            f"{overlap}-frame overlap between chunks."
+            if overlap
+            else "Overlap off."
+        )
+        tail_padding = plans[-1].pad_count if plans else 0
+        padding_text = (
+            f"Only the final chunk is padded by {tail_padding} frame(s)."
+            if tail_padding
+            else "No trailing padding needed."
+        )
+        self.chunk_label.setText(
+            f"Requested {requested_chunk_size} frames, using {snapped_chunk_size} "
+            f"(nearest WAN-safe chunk rounded down). {overlap_text}\n"
+            f"Source chunk lengths: {raw_preview}. {padding_text}"
+        )
+
+    def update_quality_label(self, val):
+        if val <= 3:
+            desc = "Small File"
+        elif val <= 6:
+            desc = "Balanced"
+        else:
+            desc = "High Quality"
+
+        self.quality_label.setText(f"Quality: {val} ({desc})")

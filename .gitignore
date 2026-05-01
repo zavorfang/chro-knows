@@ -11,6 +11,9 @@ venv/
 .ruff_cache/
 .pytest_cache/
 __pypackages__/
+build/
+dist/
+.venv-build/
 
 # Media files (Local test clips)
 *.mp4

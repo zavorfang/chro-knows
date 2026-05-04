@@ -335,9 +335,9 @@ class MainWindow(QMainWindow):
         export_mp4_action.triggered.connect(self.show_export_mp4_dialog)
         file_menu.addAction(export_mp4_action)
 
-        export_wan_action = QAction("Export WAN 2.2 Chunks...", self)
-        export_wan_action.triggered.connect(self.show_export_wan_dialog)
-        file_menu.addAction(export_wan_action)
+        wan_prep_action = QAction("Wan Preparation...", self)
+        wan_prep_action.triggered.connect(self.show_wan_preparation_dialog)
+        file_menu.addAction(wan_prep_action)
 
         file_menu.addSeparator()
 
@@ -1575,12 +1575,12 @@ class MainWindow(QMainWindow):
             if filepath:
                 self.export_mp4(filepath, start_frame, end_frame, quality, preset)
 
-    def show_export_wan_dialog(self):
+    def show_wan_preparation_dialog(self):
         if self.total_frames == 0:
             QMessageBox.warning(self, "Export", "No project loaded.")
             return
 
-        dialog = ExportWanChunksDialog(self)
+        dialog = WanPreparationDialog(self)
         if dialog.exec() == QDialog.DialogCode.Accepted:
             output_folder = dialog.output_folder.text().strip()
             prefix = dialog.filename_prefix.text().strip()
@@ -1588,13 +1588,22 @@ class MainWindow(QMainWindow):
             overlap = dialog.get_overlap()
             quality = dialog.quality_slider.value()
             preset = dialog.speed_combo.currentText()
+            start_frame = dialog.start_spinbox.value()
+            end_frame = dialog.end_spinbox.value()
+            grid_size = dialog.grid_combo.currentData()
+            per_chunk_grid = dialog.per_chunk_grid_checkbox.isChecked()
+
+            if start_frame > end_frame:
+                QMessageBox.warning(self, "Invalid Range", "Start frame must be before end frame.")
+                return
 
             if not output_folder:
                 QMessageBox.warning(self, "Export", "Please choose an output folder.")
                 return
 
-            self.export_wan_chunks(
-                output_folder, prefix, chunk_size, overlap, quality, preset
+            self.prepare_wan(
+                output_folder, prefix, chunk_size, overlap, quality, preset,
+                start_frame, end_frame, grid_size, per_chunk_grid
             )
 
     def get_export_fps(self):
@@ -1697,52 +1706,118 @@ class MainWindow(QMainWindow):
         finally:
             progress.close()
 
-    def export_wan_chunks(
-        self, output_folder, prefix, chunk_size, overlap, quality, preset="fast"
+    def prepare_wan(
+        self, output_folder, prefix, chunk_size, overlap, quality, preset,
+        start_frame, end_frame, grid_size, per_chunk_grid=False
     ):
         chunk_size = normalize_wan_chunk_size(chunk_size)
         overlap = normalize_chunk_overlap(overlap, chunk_size)
-        chunk_plan = plan_wan_chunks(self.total_frames, chunk_size, overlap)
+        
+        total_frames_to_chunk = end_frame - start_frame + 1
+        chunk_plan = plan_wan_chunks(total_frames_to_chunk, chunk_size, overlap)
         if not chunk_plan:
             QMessageBox.warning(self, "Export", "No frames available for export.")
             return
 
         prefix = sanitize_filename_part(prefix)
-        total_output_frames = sum(chunk.target_length for chunk in chunk_plan)
+        
+        # Grid optimization logic
+        num_chunks = len(chunk_plan)
+        preferred_dim = None
+        if grid_size == '2x2': preferred_dim = 2
+        elif grid_size == '3x3': preferred_dim = 3
+        
+        dims = [preferred_dim] if preferred_dim else [3, 2]
+        if num_chunks == 1 and not preferred_dim:
+            best_k, best_dim = 4, 2
+        elif num_chunks == 3 and not preferred_dim:
+            best_k, best_dim = 3, 3
+        else:
+            best_k, best_dim = None, None
+            for k in range(3, 6):
+                for dim in dims:
+                    cap = dim * dim
+                    if (num_chunks * k) % cap == 0:
+                        best_k, best_dim = k, dim
+                        break
+                if best_k is not None:
+                    break
+            
+            if best_k is None:
+                best_k = 3
+                if preferred_dim:
+                    best_dim = preferred_dim
+                else:
+                    best_dim = dims[0]
+                    best_waste = float('inf')
+                    for dim in dims:
+                        cap = dim * dim
+                        waste = (cap - ((num_chunks * best_k) % cap)) % cap
+                        if waste < best_waste:
+                            best_waste = waste
+                            best_dim = dim
+
+        # Dynamically distribute missing frames to eliminate black squares
+        cap = best_dim * best_dim
+        
+        if per_chunk_grid:
+            k_list = [cap] * num_chunks
+            best_k = cap
+        else:
+            base_total = num_chunks * best_k
+            missing = (cap - (base_total % cap)) % cap
+            
+            k_list = [best_k] * num_chunks
+            for i in range(missing):
+                k_list[i % num_chunks] += 1
+
+        total_mp4_frames = sum(chunk.target_length for chunk in chunk_plan)
 
         progress = QDialog(self)
-        progress.setWindowTitle("Exporting WAN 2.2 Chunks...")
+        progress.setWindowTitle("Wan Preparation...")
         progress.setFixedSize(420, 130)
         prog_layout = QVBoxLayout(progress)
         status_label = QLabel()
         status_label.setWordWrap(True)
         prog_layout.addWidget(status_label)
         bar = QProgressBar()
-        bar.setRange(0, total_output_frames)
+        bar.setRange(0, total_mp4_frames)
         prog_layout.addWidget(bar)
         progress.show()
 
         completed_frames = 0
+        all_images = []
+        selection_details = []
+
+        import cv2
+        import numpy as np
+        from dataclasses import asdict
 
         try:
             os.makedirs(output_folder, exist_ok=True)
 
             for chunk_index, chunk in enumerate(chunk_plan, start=1):
+                abs_start = start_frame + chunk.start_frame
+                abs_end_raw = start_frame + chunk.end_frame
+                # Clamp to user's selected range so we never read past the shot
+                abs_end = min(abs_end_raw, end_frame)
+                
                 filename = (
                     f"{prefix}_wan22_{chunk_index:03d}_"
                     f"{chunk.target_length:03d}f_"
-                    f"{chunk.start_frame:04d}-{chunk.end_frame:04d}.mp4"
+                    f"{abs_start:04d}-{abs_end:04d}.mp4"
                 )
                 filepath = os.path.join(output_folder, filename)
 
-                frame_numbers = list(range(chunk.start_frame, chunk.end_frame + 1))
-                if chunk.pad_count > 0:
-                    frame_numbers.extend([chunk.end_frame] * chunk.pad_count)
+                frame_numbers = list(range(abs_start, abs_end + 1))
+                # Pad with the last valid frame to reach WAN-safe target length
+                pad_needed = chunk.target_length - len(frame_numbers)
+                if pad_needed > 0:
+                    frame_numbers.extend([abs_end] * pad_needed)
 
                 status_label.setText(
-                    f"Chunk {chunk_index}/{len(chunk_plan)}: "
-                    f"frames {chunk.start_frame}-{chunk.end_frame} "
-                    f"-> {chunk.target_length} WAN-safe frames"
+                    f"Processing chunk {chunk_index}/{len(chunk_plan)}: "
+                    f"frames {abs_start}-{abs_end}"
                 )
                 QApplication.processEvents()
 
@@ -1760,18 +1835,100 @@ class MainWindow(QMainWindow):
 
                 completed_frames += len(frame_numbers)
 
-            bar.setValue(total_output_frames)
+                k_i = k_list[chunk_index - 1]
+                span = abs_end - abs_start
+                if span == 0:
+                    indices = [abs_start] * k_i
+                else:
+                    indices = [abs_start + i * span // (k_i - 1) for i in range(k_i)]
+                
+                chunk_images = []
+                for idx in indices:
+                    pixmap = self.load_frame_data(idx)
+                    if pixmap:
+                        img_rgb = self.pixmap_to_rgb_array(pixmap)
+                        chunk_images.append(img_rgb)
+                    else:
+                        chunk_images.append(np.zeros((256, 256, 3), dtype=np.uint8))
+                        
+                all_images.extend(chunk_images)
+                selection_details.append({
+                    "chunk_index": chunk_index - 1,
+                    "chunk_data": asdict(chunk),
+                    "video_start_frame_abs": abs_start,
+                    "video_end_frame_abs": abs_end,
+                    "selected_frames_abs": indices
+                })
+
+            bar.setValue(total_mp4_frames)
             QApplication.processEvents()
+            
+            status_label.setText("Generating grids and metadata...")
+            QApplication.processEvents()
+            
+            cap = best_dim * best_dim
+            grids = []
+            if all_images:
+                h, w = all_images[0].shape[:2]
+                for i in range(0, len(all_images), cap):
+                    batch = all_images[i:i+cap]
+                    while len(batch) < cap:
+                        batch.append(np.zeros((h, w, 3), dtype=np.uint8))
+                    
+                    rows = []
+                    for r in range(best_dim):
+                        row_images = batch[r*best_dim : (r+1)*best_dim]
+                        row_images = [cv2.resize(img, (w, h)) for img in row_images]
+                        rows.append(np.hstack(row_images))
+                        
+                    grid = np.vstack(rows)
+                    grids.append(grid)
+            
+            saved_grids = []
+            for i, grid in enumerate(grids):
+                if per_chunk_grid:
+                    grid_filename = f"{prefix}_chunk_{i+1:03d}_grid_{best_dim}x{best_dim}.jpg"
+                else:
+                    grid_filename = f"{prefix}_grid_{best_dim}x{best_dim}_{i:03d}.jpg"
+                grid_path = os.path.join(output_folder, grid_filename)
+                
+                # Write to disk
+                frame_bgr = cv2.cvtColor(grid, cv2.COLOR_RGB2BGR)
+                params = [cv2.IMWRITE_JPEG_QUALITY, 95]
+                cv2.imwrite(grid_path, frame_bgr, params)
+                saved_grids.append(grid_filename)
+                
+            metadata = {}
+            for detail in selection_details:
+                chunk_num = detail['chunk_index'] + 1
+                start_f = detail['video_start_frame_abs']
+                metadata[f"chunk {chunk_num}"] = [f - start_f for f in detail['selected_frames_abs']]
+            
+            metadata.update({
+                "start_frame": start_frame,
+                "end_frame": end_frame,
+                "total_frames_processed": total_frames_to_chunk,
+                "chunk_size": chunk_size,
+                "overlap": overlap,
+                "num_chunks": num_chunks,
+                "k_frames_per_chunk": best_k,
+                "grid_dim": best_dim,
+                "output_grids": saved_grids,
+                "chunks": selection_details
+            })
+            
+            import json
+            with open(os.path.join(output_folder, f"{prefix}_wan_preparation.json"), "w") as f:
+                json.dump(metadata, f, indent=4)
 
             QMessageBox.information(
                 self,
-                "Export Complete",
-                f"Exported {len(chunk_plan)} WAN 2.2 chunk(s) "
-                f"using a {chunk_size}-frame chunk size"
-                f"{f' with {overlap}-frame overlap' if overlap else ''} "
-                f"to {output_folder}",
+                "Preparation Complete",
+                f"Generated {num_chunks} chunk(s), {len(grids)} {best_dim}x{best_dim} grid(s), and JSON metadata.",
             )
         except Exception as e:
+            import traceback
+            traceback.print_exc()
             QMessageBox.critical(self, "Export Error", str(e))
         finally:
             progress.close()
@@ -2129,13 +2286,13 @@ class ExportMp4Dialog(QDialog):
         self.quality_label.setText(f"Quality: {val} ({desc})")
 
 
-class ExportWanChunksDialog(QDialog):
+class WanPreparationDialog(QDialog):
     def __init__(self, parent):
         super().__init__(parent)
         self.parent_window = parent
-        self.setWindowTitle("Export WAN 2.2 Chunks")
+        self.setWindowTitle("Wan Preparation")
         self.setModal(True)
-        self.setMinimumWidth(380)
+        self.setMinimumWidth(400)
 
         layout = QFormLayout(self)
         self.plan_info = QLabel()
@@ -2166,6 +2323,28 @@ class ExportWanChunksDialog(QDialog):
             default_name = parent.project.name
         self.filename_prefix = QLineEdit(sanitize_filename_part(default_name))
         layout.addRow("Filename Prefix:", self.filename_prefix)
+
+        self.start_spinbox = QSpinBox()
+        self.start_spinbox.setRange(0, parent.total_frames - 1)
+        self.start_spinbox.setValue(0)
+        self.start_spinbox.valueChanged.connect(self.update_chunk_preview)
+        layout.addRow("Start Frame:", self.start_spinbox)
+
+        self.end_spinbox = QSpinBox()
+        self.end_spinbox.setRange(0, parent.total_frames - 1)
+        self.end_spinbox.setValue(parent.total_frames - 1)
+        self.end_spinbox.valueChanged.connect(self.update_chunk_preview)
+        layout.addRow("End Frame:", self.end_spinbox)
+
+        self.grid_combo = QComboBox()
+        self.grid_combo.addItem("Auto (Dynamic)", None)
+        self.grid_combo.addItem("2x2 Grid", "2x2")
+        self.grid_combo.addItem("3x3 Grid", "3x3")
+        layout.addRow("Grid Size:", self.grid_combo)
+
+        self.per_chunk_grid_checkbox = QCheckBox("One grid per chunk")
+        self.per_chunk_grid_checkbox.setChecked(False)
+        layout.addRow("Grid Mode:", self.per_chunk_grid_checkbox)
 
         self.chunk_size_spinbox = QSpinBox()
         self.chunk_size_spinbox.setRange(1, 10000)
@@ -2247,6 +2426,14 @@ class ExportWanChunksDialog(QDialog):
         self.update_chunk_preview()
 
     def update_chunk_preview(self, *_args):
+        start_f = self.start_spinbox.value()
+        end_f = self.end_spinbox.value()
+        if start_f > end_f:
+            self.plan_info.setText("Invalid frame range: Start > End")
+            return
+
+        total_span = end_f - start_f + 1
+
         requested_chunk_size = self.chunk_size_spinbox.value()
         snapped_chunk_size = normalize_wan_chunk_size(requested_chunk_size)
 
@@ -2269,7 +2456,7 @@ class ExportWanChunksDialog(QDialog):
         self.overlap_spinbox.setEnabled(
             overlap_available and self.overlap_checkbox.isChecked()
         )
-        plans = plan_wan_chunks(self.parent_window.total_frames, snapped_chunk_size, overlap)
+        plans = plan_wan_chunks(total_span, snapped_chunk_size, overlap)
 
         target_lengths = [str(chunk.target_length) for chunk in plans]
         target_preview = ", ".join(target_lengths[:6])
@@ -2287,7 +2474,7 @@ class ExportWanChunksDialog(QDialog):
             raw_preview += ", ..."
 
         self.plan_info.setText(
-            f"{self.parent_window.total_frames} source frames will export as "
+            f"{total_span} source frames will export as "
             f"{len(plans)} WAN-safe clip(s): {target_preview}"
         )
 

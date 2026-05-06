@@ -2,6 +2,7 @@ import unittest
 
 from app_utils import (
     build_bookmark_export_filename,
+    build_bookmark_video_export_filename,
     build_frame_export_filename,
     build_recent_file_label,
     ensure_extension,
@@ -61,6 +62,10 @@ class AppUtilsTests(unittest.TestCase):
             "shot010", 3, 24, "Camera Note", ".jpg"
         )
         self.assertEqual(filename, "shot010_bookmark_003_f0025_Camera Note.jpg")
+
+    def test_bookmark_video_export_filename_is_predictable(self):
+        filename = build_bookmark_video_export_filename("shot 010", ".mp4")
+        self.assertEqual(filename, "shot 010_bookmarks.mp4")
 
 
 if __name__ == "__main__":

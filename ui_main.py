@@ -1,6 +1,7 @@
 import json
 import os
 import shutil
+import tempfile
 import threading
 
 from PyQt6.QtWidgets import (
@@ -67,6 +68,7 @@ from app_utils import (
     IMAGE_EXPORT_FILTER,
     IMAGE_EXPORT_FORMATS,
     build_bookmark_export_filename,
+    build_bookmark_video_export_filename,
     build_frame_export_filename,
     build_recent_file_label,
     ensure_extension,
@@ -75,10 +77,36 @@ from app_utils import (
     push_recent_file,
     sanitize_filename_part,
 )
+from gemma_shot_detection import (
+    AnalysisChunk,
+    ChunkShotAnalysis,
+    DetectedShot,
+    GemmaShot,
+    SHOT_ANALYSIS_CHUNK_SECONDS,
+    TraditionalCutCandidate,
+    description_similarity,
+    detect_cut_candidates_from_scores,
+    extract_json_payload,
+    finalize_shot_ranges,
+    find_nearest_candidate,
+    frame_to_timestamp,
+    match_chunk_shots_to_candidates,
+    merge_shot_descriptions,
+    parse_chunk_shot_response,
+    plan_shot_analysis_chunks,
+    should_merge_boundary_duplicate,
+)
 
 
 class MainWindow(QMainWindow):
     frame_changed = pyqtSignal(int)
+    DUMMY_API_KEYS = {
+        "",
+        "AIzaSyDUMMY_REPLACE_ME",
+        "your-google-ai-studio-key-here",
+        "replace-with-your-google-ai-studio-key",
+        "dummy-gemini-key",
+    }
 
     def __init__(self):
         super().__init__()
@@ -167,9 +195,15 @@ class MainWindow(QMainWindow):
         right_layout.addWidget(QLabel("Bookmarks"))
         right_layout.addWidget(self.bookmark_list)
 
-        add_bookmark_btn = QPushButton("+ Add Bookmark")
-        add_bookmark_btn.clicked.connect(self.add_bookmark)
-        right_layout.addWidget(add_bookmark_btn)
+        bookmark_button_row = QHBoxLayout()
+        self.add_bookmark_btn = QPushButton("+ Add Bookmark")
+        self.add_bookmark_btn.clicked.connect(self.handle_bookmark_button)
+        bookmark_button_row.addWidget(self.add_bookmark_btn)
+
+        self.clear_bookmarks_btn = QPushButton("Clear Bookmarks")
+        self.clear_bookmarks_btn.clicked.connect(self.delete_all_bookmarks)
+        bookmark_button_row.addWidget(self.clear_bookmarks_btn)
+        right_layout.addLayout(bookmark_button_row)
 
         top_splitter.addWidget(right_panel)
         top_splitter.setStretchFactor(0, 4)
@@ -310,34 +344,41 @@ class MainWindow(QMainWindow):
 
         file_menu.addSeparator()
 
-        export_action = QAction("Export...", self)
+        export_menu = file_menu.addMenu("Export")
+
+        export_action = QAction("Frame / Sequence...", self)
         export_action.setShortcut(QKeySequence.StandardKey.Print)
         export_action.triggered.connect(self.show_export_dialog)
-        file_menu.addAction(export_action)
+        export_menu.addAction(export_action)
 
-        export_current_frame_action = QAction("Export Current Frame Image...", self)
+        export_current_frame_action = QAction("Current Frame Image...", self)
         export_current_frame_action.triggered.connect(self.export_current_frame_image)
-        file_menu.addAction(export_current_frame_action)
+        export_menu.addAction(export_current_frame_action)
 
-        export_first_frame_action = QAction("Export First Frame Image...", self)
+        export_first_frame_action = QAction("First Frame Image...", self)
         export_first_frame_action.triggered.connect(self.export_first_frame_image)
-        file_menu.addAction(export_first_frame_action)
+        export_menu.addAction(export_first_frame_action)
 
-        export_last_frame_action = QAction("Export Last Frame Image...", self)
+        export_last_frame_action = QAction("Last Frame Image...", self)
         export_last_frame_action.triggered.connect(self.export_last_frame_image)
-        file_menu.addAction(export_last_frame_action)
+        export_menu.addAction(export_last_frame_action)
 
-        export_bookmarks_action = QAction("Export Bookmarks as Images...", self)
+        export_bookmarks_action = QAction("Bookmarks...", self)
         export_bookmarks_action.triggered.connect(self.show_export_bookmarks_dialog)
-        file_menu.addAction(export_bookmarks_action)
+        export_menu.addAction(export_bookmarks_action)
 
-        export_mp4_action = QAction("Export MP4...", self)
+        export_mp4_action = QAction("MP4...", self)
         export_mp4_action.triggered.connect(self.show_export_mp4_dialog)
-        file_menu.addAction(export_mp4_action)
+        export_menu.addAction(export_mp4_action)
 
         wan_prep_action = QAction("Wan Preparation...", self)
         wan_prep_action.triggered.connect(self.show_wan_preparation_dialog)
-        file_menu.addAction(wan_prep_action)
+        export_menu.addAction(wan_prep_action)
+
+        gemma_shot_action = QAction("Detect Shots with Gemma...", self)
+        gemma_shot_action.setShortcut(QKeySequence("Ctrl+Shift+G"))
+        gemma_shot_action.triggered.connect(self.show_gemma_shot_detection_dialog)
+        file_menu.addAction(gemma_shot_action)
 
         file_menu.addSeparator()
 
@@ -390,11 +431,13 @@ class MainWindow(QMainWindow):
         # Overview bar (thin, full-width, no thumbnails)
         self.overview_timeline = OverviewTimelineWidget(self)
         self.overview_timeline.frame_selected.connect(self.seek_to_frame)
+        self.overview_timeline.bookmark_hovered.connect(self.on_timeline_bookmark_hovered)
         self.timeline_layout.addWidget(self.overview_timeline)
 
         # Thumbnail timeline (scrollable, for fine scrubbing)
         self.timeline = TimelineWidget(self)
         self.timeline.frame_selected.connect(self.seek_to_frame)
+        self.timeline.bookmark_hovered.connect(self.on_timeline_bookmark_hovered)
 
         self.timeline_scroll = QScrollArea()
         self.timeline_scroll.setWidgetResizable(True)
@@ -431,6 +474,8 @@ class MainWindow(QMainWindow):
 
     def init_bookmark_panel(self):
         self.bookmarks = []
+        self.hovered_timeline_bookmark_frame = None
+        self.update_bookmark_button_state()
 
     def get_settings_path(self):
         return os.path.join(os.path.expanduser("~"), ".kfpro_lite_settings.json")
@@ -466,6 +511,7 @@ class MainWindow(QMainWindow):
         self.timeline.set_playhead(0)
         self.overview_timeline.bookmarks.clear()
         self.overview_timeline.set_playhead(0)
+        self.hovered_timeline_bookmark_frame = None
         if clear_bookmarks:
             self.bookmarks = []
             self.update_bookmark_list()
@@ -948,6 +994,7 @@ class MainWindow(QMainWindow):
         self.load_frame(frame_num)
         self.update_frame_display()
         self.sync_timeline_scroll()
+        self.update_bookmark_button_state()
 
     def play_step(self):
         if self.is_playing:
@@ -967,6 +1014,7 @@ class MainWindow(QMainWindow):
             self.timeline.set_playhead(self.current_frame)
             self.overview_timeline.set_playhead(self.current_frame)
             self.sync_timeline_scroll()
+            self.update_bookmark_button_state()
 
     def toggle_play(self):
         self.is_playing = not self.is_playing
@@ -992,6 +1040,7 @@ class MainWindow(QMainWindow):
             self.update_frame_display()
             self.timeline.set_playhead(self.current_frame)
             self.overview_timeline.set_playhead(self.current_frame)
+            self.update_bookmark_button_state()
 
     def next_frame(self):
         if self.current_frame < self.total_frames - 1:
@@ -1000,6 +1049,7 @@ class MainWindow(QMainWindow):
             self.update_frame_display()
             self.timeline.set_playhead(self.current_frame)
             self.overview_timeline.set_playhead(self.current_frame)
+            self.update_bookmark_button_state()
 
     def jump_to_start(self):
         self.current_frame = 0
@@ -1007,6 +1057,7 @@ class MainWindow(QMainWindow):
         self.update_frame_display()
         self.timeline.set_playhead(0)
         self.overview_timeline.set_playhead(0)
+        self.update_bookmark_button_state()
 
     def jump_to_end(self):
         self.current_frame = max(0, self.total_frames - 1)
@@ -1014,6 +1065,7 @@ class MainWindow(QMainWindow):
         self.update_frame_display()
         self.timeline.set_playhead(self.current_frame)
         self.overview_timeline.set_playhead(self.current_frame)
+        self.update_bookmark_button_state()
 
     def toggle_loop(self):
         self.loop_enabled = not self.loop_enabled
@@ -1066,7 +1118,7 @@ class MainWindow(QMainWindow):
         export_last_action.setEnabled(self.total_frames > 0)
         menu.addAction(export_last_action)
 
-        export_bookmarks_action = QAction("Export Bookmarks as Images...", self)
+        export_bookmarks_action = QAction("Export Bookmarks...", self)
         export_bookmarks_action.triggered.connect(self.show_export_bookmarks_dialog)
         export_bookmarks_action.setEnabled(bool(self.bookmarks))
         menu.addAction(export_bookmarks_action)
@@ -1154,21 +1206,35 @@ class MainWindow(QMainWindow):
         if dialog.exec() != QDialog.DialogCode.Accepted:
             return
 
-        output_folder = dialog.output_folder.text().strip()
-        prefix = dialog.filename_prefix.text().strip()
-        format_name = dialog.get_format_name()
-        jpeg_quality = dialog.jpeg_quality.value()
+        if dialog.is_video_mode():
+            output_path = dialog.output_path.text().strip()
+            if not output_path:
+                QMessageBox.warning(self, "Export", "Please choose an output file.")
+                return
 
+            self.export_bookmarks_as_video(
+                ensure_extension(output_path, ".mp4"),
+                dialog.hold_spinbox.value(),
+                dialog.fps_spinbox.value(),
+                dialog.quality_slider.value(),
+                dialog.speed_combo.currentText(),
+            )
+            return
+
+        output_folder = dialog.output_folder.text().strip()
         if not output_folder:
             QMessageBox.warning(self, "Export", "Please choose an output folder.")
             return
 
         self.export_bookmarks_as_images(
             output_folder,
-            prefix,
-            format_name,
-            jpeg_quality=jpeg_quality,
+            dialog.filename_prefix.text().strip(),
+            dialog.get_format_name(),
+            jpeg_quality=dialog.jpeg_quality.value(),
         )
+
+    def show_export_bookmarks_video_dialog(self):
+        self.show_export_bookmarks_dialog()
 
     def build_bookmark_export_requests(self, output_folder, prefix, format_name):
         extension = IMAGE_EXPORT_FORMATS[format_name]["extension"]
@@ -1217,6 +1283,79 @@ class MainWindow(QMainWindow):
             )
         except Exception as e:
             QMessageBox.critical(self, "Export Error", str(e))
+
+    def build_bookmark_video_frame_numbers(self, hold_frames):
+        hold_frames = max(1, int(hold_frames))
+        sorted_bookmarks = sorted(
+            self.bookmarks, key=lambda bm: (bm["frame"], bm.get("name", ""))
+        )
+        frame_numbers = []
+        for bookmark in sorted_bookmarks:
+            frame_numbers.extend([bookmark["frame"]] * hold_frames)
+        return sorted_bookmarks, frame_numbers
+
+    def export_bookmarks_as_video(
+        self, filepath, hold_frames, export_fps, quality, preset="fast"
+    ):
+        hold_frames = max(1, int(hold_frames))
+        export_fps = max(1, int(export_fps))
+        sorted_bookmarks, frame_numbers = self.build_bookmark_video_frame_numbers(
+            hold_frames
+        )
+        if not frame_numbers:
+            QMessageBox.warning(self, "Export", "No bookmarks available to export.")
+            return
+
+        progress = QDialog(self)
+        progress.setWindowTitle("Exporting Bookmark Video...")
+        progress.setFixedSize(420, 140)
+        prog_layout = QVBoxLayout(progress)
+        status_label = QLabel()
+        status_label.setWordWrap(True)
+        prog_layout.addWidget(status_label)
+        bar = QProgressBar()
+        bar.setRange(0, len(frame_numbers))
+        prog_layout.addWidget(bar)
+        progress.show()
+
+        try:
+            def update_progress(output_index, total, source_frame):
+                bookmark_index = min(
+                    len(sorted_bookmarks), ((output_index - 1) // hold_frames) + 1
+                )
+                bookmark = sorted_bookmarks[bookmark_index - 1]
+                bookmark_name = bookmark.get("name") or f"Bookmark {bookmark_index}"
+                status_label.setText(
+                    f"Encoding bookmark {bookmark_index}/{len(sorted_bookmarks)}: "
+                    f"frame {source_frame + 1} ({bookmark_name})"
+                )
+                bar.setValue(output_index)
+                QApplication.processEvents()
+
+            self.write_mp4_file(
+                filepath,
+                frame_numbers,
+                quality,
+                preset,
+                progress_callback=update_progress,
+                fps=export_fps,
+            )
+
+            bar.setValue(len(frame_numbers))
+            QApplication.processEvents()
+
+            self.remember_export_folder(filepath)
+            total_duration = len(frame_numbers) / export_fps
+            QMessageBox.information(
+                self,
+                "Export Complete",
+                f"Exported {len(sorted_bookmarks)} bookmark(s) to {filepath}\n"
+                f"Duration: {total_duration:.2f} seconds at {export_fps} fps.",
+            )
+        except Exception as e:
+            QMessageBox.critical(self, "Export Error", str(e))
+        finally:
+            progress.close()
 
     def save_image_export_requests(
         self, requests, format_name, jpeg_quality=95, progress_title="Exporting Images"
@@ -1386,8 +1525,60 @@ class MainWindow(QMainWindow):
         if bookmark_data:
             self.seek_to_frame(bookmark_data["frame"])
 
+    def get_bookmark_for_frame(self, frame):
+        for bookmark in self.bookmarks:
+            if bookmark.get("frame") == frame:
+                return bookmark
+        return None
+
+    def on_timeline_bookmark_hovered(self, frame):
+        self.hovered_timeline_bookmark_frame = frame if frame >= 0 else None
+        self.update_bookmark_button_state()
+
+    def update_bookmark_button_state(self):
+        if not hasattr(self, "add_bookmark_btn"):
+            return
+
+        target_frame = self.hovered_timeline_bookmark_frame
+        if target_frame is not None:
+            bookmark = self.get_bookmark_for_frame(target_frame)
+            if bookmark:
+                self.add_bookmark_btn.setText("- Remove Bookmark")
+                self.add_bookmark_btn.setToolTip(
+                    f"Remove bookmark at frame {target_frame + 1}"
+                )
+                return
+
+        current_bookmark = self.get_bookmark_for_frame(self.current_frame)
+        if current_bookmark:
+            self.add_bookmark_btn.setText("- Remove Bookmark")
+            self.add_bookmark_btn.setToolTip(
+                f"Remove bookmark at the current frame ({self.current_frame + 1})"
+            )
+        else:
+            self.add_bookmark_btn.setText("+ Add Bookmark")
+            self.add_bookmark_btn.setToolTip(
+                f"Add a bookmark at the current frame ({self.current_frame + 1})"
+            )
+
+    def handle_bookmark_button(self):
+        target_frame = self.hovered_timeline_bookmark_frame
+        if target_frame is not None and self.get_bookmark_for_frame(target_frame):
+            self.delete_bookmark_by_frame(target_frame)
+            return
+
+        if self.get_bookmark_for_frame(self.current_frame):
+            self.delete_bookmark_by_frame(self.current_frame)
+            return
+
+        self.add_bookmark()
+
     def add_bookmark(self):
         if self.total_frames == 0:
+            return
+
+        if self.get_bookmark_for_frame(self.current_frame):
+            self.update_bookmark_button_state()
             return
 
         bookmark = {
@@ -1400,6 +1591,7 @@ class MainWindow(QMainWindow):
         self.update_bookmark_list()
         self.timeline.add_bookmark(self.current_frame)
         self.overview_timeline.add_bookmark(self.current_frame)
+        self.update_bookmark_button_state()
 
     def update_bookmark_list(self):
         self.bookmark_list.clear()
@@ -1413,6 +1605,10 @@ class MainWindow(QMainWindow):
 
             self.bookmark_list.addItem(item)
 
+        if hasattr(self, "clear_bookmarks_btn"):
+            self.clear_bookmarks_btn.setEnabled(bool(self.bookmarks))
+        self.update_bookmark_button_state()
+
     def show_bookmark_context_menu(self, position):
         item = self.bookmark_list.itemAt(position)
         if item:
@@ -1423,10 +1619,16 @@ class MainWindow(QMainWindow):
             )
             menu.addAction(export_action)
 
-            export_all_action = QAction("Export All Bookmarks as Images...", self)
+            export_all_action = QAction("Export Bookmarks...", self)
             export_all_action.triggered.connect(self.show_export_bookmarks_dialog)
             export_all_action.setEnabled(bool(self.bookmarks))
             menu.addAction(export_all_action)
+
+            menu.addSeparator()
+            clear_action = QAction("Delete All Bookmarks", self)
+            clear_action.triggered.connect(self.delete_all_bookmarks)
+            clear_action.setEnabled(bool(self.bookmarks))
+            menu.addAction(clear_action)
 
             menu.addSeparator()
             delete_action = QAction("Delete Bookmark", self)
@@ -1434,14 +1636,44 @@ class MainWindow(QMainWindow):
             menu.addAction(delete_action)
             menu.exec(self.bookmark_list.mapToGlobal(position))
 
+    def delete_bookmark_by_frame(self, frame):
+        if self.get_bookmark_for_frame(frame) is None:
+            self.update_bookmark_button_state()
+            return
+        self.bookmarks = [b for b in self.bookmarks if b["frame"] != frame]
+        self.timeline.remove_bookmark(frame)
+        self.overview_timeline.remove_bookmark(frame)
+        if self.hovered_timeline_bookmark_frame == frame:
+            self.hovered_timeline_bookmark_frame = None
+        self.update_bookmark_list()
+
     def delete_bookmark(self, item):
         bookmark_data = item.data(Qt.ItemDataRole.UserRole)
         if bookmark_data:
-            frame = bookmark_data["frame"]
-            self.bookmarks = [b for b in self.bookmarks if b["frame"] != frame]
-            self.timeline.remove_bookmark(frame)
-            self.overview_timeline.remove_bookmark(frame)
-            self.update_bookmark_list()
+            self.delete_bookmark_by_frame(bookmark_data["frame"])
+
+    def delete_all_bookmarks(self):
+        if not self.bookmarks:
+            self.update_bookmark_button_state()
+            return
+
+        reply = QMessageBox.question(
+            self,
+            "Delete All Bookmarks",
+            "Delete all bookmarks from this clip?",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No,
+        )
+        if reply != QMessageBox.StandardButton.Yes:
+            return
+
+        self.bookmarks = []
+        self.timeline.bookmarks.clear()
+        self.timeline.update()
+        self.overview_timeline.bookmarks.clear()
+        self.overview_timeline.update()
+        self.hovered_timeline_bookmark_frame = None
+        self.update_bookmark_list()
 
     def save_project(self):
         filepath, _ = QFileDialog.getSaveFileName(
@@ -1472,7 +1704,11 @@ class MainWindow(QMainWindow):
             "settings": {"fps": self.fps, "loop": self.loop_enabled},
         }
 
-        if self.project.sources:
+        # Save video source info if loaded from a video file
+        if getattr(self.project, "is_video", False) and hasattr(self.project, "video_path"):
+            project_data["video_path"] = self.project.video_path
+            project_data["is_video"] = True
+        elif self.project.sources:
             source = self.project.sources[0]
             project_data["sources"].append(
                 {
@@ -1501,38 +1737,58 @@ class MainWindow(QMainWindow):
             with open(filepath, "r") as f:
                 project_data = json.load(f)
 
-            if project_data.get("sources"):
+            media_loaded = False
+
+            # Try loading as a video project first
+            if project_data.get("is_video") and project_data.get("video_path"):
+                video_path = project_data["video_path"]
+                if os.path.exists(video_path):
+                    media_loaded = self.load_video(video_path, add_to_recent=False)
+                else:
+                    QMessageBox.warning(
+                        self,
+                        "Missing Video",
+                        f"Video file not found:\n{video_path}",
+                    )
+            # Fall back to folder-based source
+            elif project_data.get("sources"):
                 source_data = project_data["sources"][0]
                 folder = source_data.get("absolute", source_data.get("path", ""))
-
                 if os.path.exists(folder):
                     self.project.folder = folder
-                    self.scan_folder(folder, add_to_recent=False)
+                    media_loaded = self.scan_folder(folder, add_to_recent=False)
+                else:
+                    QMessageBox.warning(
+                        self,
+                        "Missing Folder",
+                        f"Source folder not found:\n{folder}",
+                    )
 
-                    if "timeline" in project_data:
-                        self.current_frame = project_data["timeline"].get("current", 0)
-                        self.seek_to_frame(self.current_frame)
+            if media_loaded:
+                if "timeline" in project_data:
+                    self.current_frame = project_data["timeline"].get("current", 0)
+                    self.seek_to_frame(self.current_frame)
 
-                    if "bookmarks" in project_data:
-                        self.bookmarks = project_data["bookmarks"]
-                        self.update_bookmark_list()
-                        for bm in self.bookmarks:
-                            self.timeline.add_bookmark(bm["frame"])
-                            self.overview_timeline.add_bookmark(bm["frame"])
+                if "bookmarks" in project_data:
+                    self.bookmarks = project_data["bookmarks"]
+                    self.update_bookmark_list()
+                    for bm in self.bookmarks:
+                        self.timeline.add_bookmark(bm["frame"])
+                        self.overview_timeline.add_bookmark(bm["frame"])
 
-                    if "view" in project_data:
-                        view = project_data["view"]
-                        self.view_pan = QPointF(
-                            view.get("panX", 0), view.get("panY", 0)
-                        )
-                        self.view_zoom = view.get("zoom", 1.0)
+                if "view" in project_data:
+                    view = project_data["view"]
+                    self.view_pan = QPointF(
+                        view.get("panX", 0), view.get("panY", 0)
+                    )
+                    self.view_zoom = view.get("zoom", 1.0)
 
-                    if "settings" in project_data:
-                        settings = project_data["settings"]
-                        self.fps = settings.get("fps", 24)
-                        self.loop_enabled = settings.get("loop", False)
-                        self.fps_label.setText(f"{self.fps} FPS")
-                        self.loop_btn.setChecked(self.loop_enabled)
+                if "settings" in project_data:
+                    settings = project_data["settings"]
+                    self.fps = settings.get("fps", 24)
+                    self.loop_enabled = settings.get("loop", False)
+                    self.fps_label.setText(f"{self.fps} FPS")
+                    self.loop_btn.setChecked(self.loop_enabled)
 
             self.add_recent_file(filepath, "project")
             self.status_bar.showMessage(f"Project loaded from {filepath}", 3000)
@@ -1606,6 +1862,959 @@ class MainWindow(QMainWindow):
                 start_frame, end_frame, grid_size, per_chunk_grid
             )
 
+    def show_gemma_shot_detection_dialog(self):
+        if self.total_frames == 0:
+            QMessageBox.warning(self, "Shot Detection", "No project loaded.")
+            return
+
+        dialog = GemmaShotDetectionDialog(self)
+        if dialog.exec() != QDialog.DialogCode.Accepted:
+            return
+
+        output_folder = dialog.output_folder.text().strip()
+        prefix = dialog.filename_prefix.text().strip()
+        model_name = dialog.model_combo.currentData()
+        api_key = dialog.api_key.text().strip() or self.get_configured_google_api_key()
+        start_frame = dialog.start_spinbox.value()
+        end_frame = dialog.end_spinbox.value()
+        add_bookmarks = dialog.add_bookmarks_checkbox.isChecked()
+        clear_existing = dialog.clear_bookmarks_checkbox.isChecked()
+
+        if start_frame > end_frame:
+            QMessageBox.warning(
+                self, "Invalid Range", "Start frame must be before end frame."
+            )
+            return
+
+        if not output_folder:
+            QMessageBox.warning(
+                self, "Shot Detection", "Please choose an output folder."
+            )
+            return
+
+        if not api_key:
+            QMessageBox.warning(
+                self,
+                "Shot Detection",
+                "Enter a Google API key or set GOOGLE_API_KEY / GEMINI_API_KEY in .env.",
+            )
+            return
+
+        if self.is_dummy_google_api_key(api_key):
+            QMessageBox.warning(
+                self,
+                "Shot Detection",
+                "The fallback API key is still the dummy placeholder from .env. Replace it with your real Google AI Studio key, or paste a key into the dialog.",
+            )
+            return
+
+        self.detect_shots_with_gemma(
+            output_folder,
+            prefix,
+            model_name,
+            api_key,
+            start_frame,
+            end_frame,
+            add_bookmarks=add_bookmarks,
+            clear_existing=clear_existing,
+        )
+
+    def _resize_rgb_frame(self, frame_rgb, max_dimension=None):
+        if not max_dimension:
+            return frame_rgb
+
+        import cv2
+
+        height, width = frame_rgb.shape[:2]
+        longest_side = max(height, width)
+        if longest_side <= max_dimension:
+            return frame_rgb
+
+        scale = max_dimension / float(longest_side)
+        new_width = max(1, int(round(width * scale)))
+        new_height = max(1, int(round(height * scale)))
+        return cv2.resize(
+            frame_rgb,
+            (new_width, new_height),
+            interpolation=cv2.INTER_AREA,
+        )
+
+    def get_rgb_frame_array(self, frame_num, max_dimension=None):
+        pixmap = self.load_frame_data(frame_num)
+        if pixmap is None:
+            raise ValueError(f"Could not load frame {frame_num}.")
+        frame_rgb = self.pixmap_to_rgb_array(pixmap)
+        return self._resize_rgb_frame(frame_rgb, max_dimension=max_dimension)
+
+    def iter_source_rgb_frames(self, start_frame, end_frame, max_dimension=None):
+        import cv2
+        import numpy as np
+        from PIL import Image
+
+        if start_frame > end_frame:
+            return
+
+        if getattr(self.project, "is_video", False) and hasattr(self.project, "video_path"):
+            video_path = self.project.video_path
+            ext = os.path.splitext(video_path)[1].lower()
+
+            if ext == ".gif":
+                gif = Image.open(video_path)
+                try:
+                    for frame_index in range(start_frame, end_frame + 1):
+                        gif.seek(frame_index)
+                        frame_rgb = np.array(gif.convert("RGB"))
+                        yield frame_index, self._resize_rgb_frame(
+                            frame_rgb, max_dimension=max_dimension
+                        )
+                finally:
+                    gif.close()
+                return
+
+            cap = cv2.VideoCapture(video_path)
+            if not cap.isOpened():
+                raise ValueError(f"Could not open video for analysis: {video_path}")
+
+            try:
+                cap.set(cv2.CAP_PROP_POS_FRAMES, start_frame)
+                frame_index = start_frame
+                while frame_index <= end_frame:
+                    ret, frame_bgr = cap.read()
+                    if not ret:
+                        raise ValueError(f"Could not read frame {frame_index}.")
+                    frame_rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
+                    yield frame_index, self._resize_rgb_frame(
+                        frame_rgb, max_dimension=max_dimension
+                    )
+                    frame_index += 1
+            finally:
+                cap.release()
+            return
+
+        if not self.project.sources:
+            raise ValueError("No source media is available for analysis.")
+
+        source = self.project.sources[0]
+        files = source.get("files", [])
+        for frame_index in range(start_frame, end_frame + 1):
+            if frame_index >= len(files):
+                raise ValueError(f"Frame {frame_index} is outside the loaded sequence.")
+            with Image.open(files[frame_index]) as image:
+                frame_rgb = np.array(image.convert("RGB"))
+            yield frame_index, self._resize_rgb_frame(
+                frame_rgb, max_dimension=max_dimension
+            )
+
+    def scan_traditional_cut_candidates(
+        self,
+        start_frame,
+        end_frame,
+        fps,
+        progress_callback=None,
+    ):
+        import cv2
+        import numpy as np
+
+        scores = []
+        previous_hist = None
+        previous_gray = None
+        previous_gray_mean = 0.0
+        previous_edges = None
+        total_frames = max(1, end_frame - start_frame + 1)
+
+        for processed_index, (_frame_index, frame_rgb) in enumerate(
+            self.iter_source_rgb_frames(start_frame, end_frame, max_dimension=256),
+            start=1,
+        ):
+            gray = cv2.cvtColor(frame_rgb, cv2.COLOR_RGB2GRAY)
+            gray = cv2.GaussianBlur(gray, (5, 5), 0)
+            hsv = cv2.cvtColor(frame_rgb, cv2.COLOR_RGB2HSV)
+            hist = cv2.calcHist([hsv], [0, 1, 2], None, [8, 8, 8], [0, 180, 0, 256, 0, 256])
+            cv2.normalize(hist, hist)
+            edges = cv2.Canny(gray, 40, 120)
+            gray_mean = float(gray.mean())
+
+            if previous_hist is not None:
+                hist_diff = float(
+                    cv2.compareHist(previous_hist, hist, cv2.HISTCMP_BHATTACHARYYA)
+                )
+                gray_diff = float(
+                    np.mean(
+                        np.abs(
+                            gray.astype(np.int16) - previous_gray.astype(np.int16)
+                        )
+                    )
+                ) / 255.0
+                edge_diff = float(np.mean(edges != previous_edges))
+                luminance_jump = abs(gray_mean - previous_gray_mean) / 255.0
+                score = (
+                    (hist_diff * 0.52)
+                    + (gray_diff * 0.25)
+                    + (edge_diff * 0.13)
+                    + (luminance_jump * 0.10)
+                )
+                scores.append(score)
+
+            previous_hist = hist
+            previous_gray = gray
+            previous_gray_mean = gray_mean
+            previous_edges = edges
+
+            if progress_callback and (
+                processed_index == 1
+                or processed_index == total_frames
+                or processed_index % 48 == 0
+            ):
+                progress_callback(processed_index / total_frames)
+
+        candidates = detect_cut_candidates_from_scores(scores, start_frame, fps)
+        return candidates, scores
+
+    def write_analysis_clip(
+        self,
+        filepath,
+        start_frame,
+        end_frame,
+        fps,
+        progress_callback=None,
+    ):
+        import imageio
+
+        output_dir = os.path.dirname(filepath)
+        if output_dir:
+            os.makedirs(output_dir, exist_ok=True)
+
+        total_frames = max(1, end_frame - start_frame + 1)
+        writer = imageio.get_writer(
+            filepath,
+            format="FFMPEG",
+            mode="I",
+            fps=fps,
+            codec="libx264",
+            macro_block_size=None,
+            quality=None,
+            output_params=["-crf", "26", "-preset", "ultrafast"],
+        )
+
+        try:
+            for output_index, (_frame_index, frame_rgb) in enumerate(
+                self.iter_source_rgb_frames(start_frame, end_frame, max_dimension=960),
+                start=1,
+            ):
+                writer.append_data(frame_rgb)
+                if progress_callback and (
+                    output_index == 1
+                    or output_index == total_frames
+                    or output_index % 48 == 0
+                ):
+                    progress_callback(output_index / total_frames)
+        finally:
+            writer.close()
+
+    def wait_for_gemma_file_ready(self, client, uploaded_file, status_callback=None):
+        import time
+
+        current = uploaded_file
+        for _ in range(180):
+            state = getattr(getattr(current, "state", None), "name", "")
+            if state != "PROCESSING":
+                if state == "FAILED":
+                    raise ValueError(
+                        f"Google rejected the uploaded video file: {getattr(current, 'name', '')}"
+                    )
+                return current
+
+            if status_callback:
+                status_callback("Waiting for Google to finish processing the clip...")
+            QApplication.processEvents()
+            time.sleep(2)
+            current = self.run_gemma_with_retry(
+                lambda: client.files.get(name=current.name),
+                "Checking uploaded chunk status",
+                status_callback=status_callback,
+                max_attempts=3,
+                base_delay_seconds=1.5,
+            )
+
+        raise TimeoutError("Timed out while waiting for Google to process the clip.")
+
+    def import_gemma_sdk(self):
+        try:
+            from google import genai
+            from google.genai import types
+            from google.genai import errors
+            return genai, types, errors
+        except ModuleNotFoundError as exc:
+            if exc.name and exc.name.startswith("google"):
+                raise RuntimeError(
+                    "The Gemma shot detector needs the `google-genai` package in the same Python environment that launches KFPlayer. "
+                    "Install it with `.venv\\Scripts\\python.exe -m pip install -r requirements.txt`, then restart the app."
+                ) from exc
+            raise
+
+    def get_configured_google_api_key(self):
+        return (
+            os.environ.get("GOOGLE_API_KEY", "").strip()
+            or os.environ.get("GEMINI_API_KEY", "").strip()
+        )
+
+    def is_dummy_google_api_key(self, api_key):
+        return (api_key or "").strip() in self.DUMMY_API_KEYS
+
+    def is_retryable_gemma_error(self, exc):
+        _genai, _types, errors = self.import_gemma_sdk()
+        if isinstance(exc, (errors.ServerError, TimeoutError)):
+            return True
+        status_code = getattr(exc, "status_code", None)
+        if isinstance(status_code, int) and status_code >= 500:
+            return True
+        message = str(exc).upper()
+        return " 500 " in message or "'CODE': 500" in message or '"CODE": 500' in message
+
+    def run_gemma_with_retry(
+        self,
+        operation,
+        action_label,
+        status_callback=None,
+        max_attempts=4,
+        base_delay_seconds=2.0,
+    ):
+        import time
+
+        last_exc = None
+        for attempt in range(1, max_attempts + 1):
+            try:
+                return operation()
+            except Exception as exc:
+                last_exc = exc
+                if not self.is_retryable_gemma_error(exc) or attempt >= max_attempts:
+                    break
+
+                wait_seconds = base_delay_seconds * (2 ** (attempt - 1))
+                if status_callback:
+                    status_callback(
+                        f"{action_label} failed with a temporary Google error. "
+                        f"Retrying in {wait_seconds:.0f}s ({attempt}/{max_attempts})..."
+                    )
+                QApplication.processEvents()
+                time.sleep(wait_seconds)
+
+        raise RuntimeError(
+            f"{action_label} failed after {max_attempts} attempts. "
+            f"Google kept returning a temporary server error.\n\nLast error: {last_exc}"
+        ) from last_exc
+
+    def analyze_chunk_with_gemma(
+        self,
+        client,
+        model_name,
+        clip_path,
+        chunk,
+        status_callback=None,
+    ):
+        _genai, types, _errors = self.import_gemma_sdk()
+
+        system_prompt = (
+            "You are an expert film editor and hard-cut boundary analyst. "
+            "Return strict JSON only."
+        )
+        prompt = f"""
+Analyze this video chunk and identify only shots separated by real edits.
+
+Chunk details:
+- Duration: {chunk.duration_seconds:.3f} seconds
+- Return times relative to the start of this chunk
+
+Return only JSON in this shape:
+{{
+  "first_shot_signature": "short phrase",
+  "last_shot_signature": "short phrase",
+  "shots": [
+    {{
+      "start_seconds": 0.0,
+      "description": "Concrete visual description of the shot after the cut: subject, framing, angle, background.",
+      "continues_from_previous": false,
+      "continues_to_next": false,
+      "confidence": 0.0
+    }}
+  ]
+}}
+
+Rules:
+- Include the first visible shot at the top of the chunk, even if it started before this chunk.
+- Add a new entry only when there is an actual edit boundary or cut to a different shot.
+- Do not create a new shot for zooms, pans, tilts, dollies, handheld drift, reframing, rack focus, character movement, or a close-up widening within one continuous take.
+- If the camera keeps rolling and the viewpoint evolves continuously, that is still one shot.
+- Keep descriptions concise and specific.
+- Set continues_from_previous on the first shot if the chunk begins mid-shot.
+- Set continues_to_next on the last shot if the chunk ends before that shot ends.
+- Confidence must be between 0 and 1.
+- If there are no edits inside the chunk, return exactly one shot entry.
+        - No markdown, no prose, no explanations outside JSON.
+""".strip()
+
+        if status_callback:
+            status_callback(f"Uploading chunk {chunk.index + 1} to Gemma...")
+        uploaded_file = self.run_gemma_with_retry(
+            lambda: client.files.upload(file=clip_path),
+            f"Uploading chunk {chunk.index + 1}",
+            status_callback=status_callback,
+        )
+        uploaded_file = self.wait_for_gemma_file_ready(client, uploaded_file, status_callback)
+
+        if status_callback:
+            status_callback(f"Gemma is analyzing chunk {chunk.index + 1}...")
+        response = self.run_gemma_with_retry(
+            lambda: client.models.generate_content(
+                model=model_name,
+                contents=[prompt, uploaded_file],
+                config=types.GenerateContentConfig(
+                    system_instruction=system_prompt,
+                    thinking_config=types.ThinkingConfig(thinking_level="high"),
+                ),
+            ),
+            f"Analyzing chunk {chunk.index + 1}",
+            status_callback=status_callback,
+        )
+
+        try:
+            shots, first_signature, last_signature = parse_chunk_shot_response(
+                response.text, chunk.duration_seconds
+            )
+            if not shots:
+                shots = [
+                    GemmaShot(
+                        start_seconds=0.0,
+                        description="Unspecified continuing shot.",
+                        continues_from_previous=chunk.index > 0,
+                        continues_to_next=True,
+                        confidence=0.0,
+                    )
+                ]
+            return ChunkShotAnalysis(
+                chunk=chunk,
+                shots=shots,
+                first_shot_signature=first_signature,
+                last_shot_signature=last_signature,
+                raw_response=response.text,
+            )
+        finally:
+            try:
+                client.files.delete(name=uploaded_file.name)
+            except Exception:
+                pass
+
+    def build_candidate_contact_sheet(self, rows, title):
+        from PIL import Image, ImageDraw, ImageOps
+
+        tile_width = 320
+        tile_height = 180
+        header_height = 38
+        row_gap = 12
+        margin = 20
+        canvas_width = margin * 2 + (tile_width * 2) + 24
+        canvas_height = margin * 2 + header_height + (
+            len(rows) * (tile_height + row_gap + header_height)
+        )
+        canvas = Image.new("RGB", (canvas_width, canvas_height), color=(245, 245, 245))
+        draw = ImageDraw.Draw(canvas)
+        draw.text((margin, margin), title, fill=(0, 0, 0))
+
+        y = margin + header_height
+        for row in rows:
+            before_image = Image.fromarray(row["before_rgb"])
+            after_image = Image.fromarray(row["after_rgb"])
+
+            before_tile = ImageOps.pad(
+                before_image,
+                (tile_width, tile_height),
+                color=(24, 24, 24),
+                centering=(0.5, 0.5),
+            )
+            after_tile = ImageOps.pad(
+                after_image,
+                (tile_width, tile_height),
+                color=(24, 24, 24),
+                centering=(0.5, 0.5),
+            )
+
+            row_label = (
+                f"{row['id']}  {row['before_timestamp']} -> {row['after_timestamp']}"
+            )
+            draw.text((margin, y), row_label, fill=(0, 0, 0))
+            image_y = y + 24
+            canvas.paste(before_tile, (margin, image_y))
+            canvas.paste(after_tile, (margin + tile_width + 24, image_y))
+            draw.text((margin, image_y + tile_height + 4), "Before", fill=(0, 0, 0))
+            draw.text(
+                (margin + tile_width + 24, image_y + tile_height + 4),
+                "After",
+                fill=(0, 0, 0),
+            )
+            y = image_y + tile_height + row_gap + 20
+
+        return canvas
+
+    def validate_candidate_rows_with_gemma(
+        self,
+        client,
+        model_name,
+        rows,
+        status_callback=None,
+        prompt_context="",
+    ):
+        _genai, types, _errors = self.import_gemma_sdk()
+
+        if not rows:
+            return {}
+
+        if status_callback:
+            status_callback("Gemma is validating precise cut candidates...")
+
+        title = "Shot-boundary validation contact sheet"
+        contact_sheet = self.build_candidate_contact_sheet(rows, title)
+        prompt = f"""
+You are validating hard-cut boundary candidates.
+
+The contact sheet contains one candidate per row.
+- Left tile: frame before the proposed cut
+- Right tile: first frame after the proposed cut
+{prompt_context}
+
+Return only JSON in this shape:
+{{
+  "candidates": [
+    {{
+      "id": "C01",
+      "is_shot_boundary": true,
+      "new_shot_description": "Description of the shot that begins on the right image.",
+      "confidence": 0.0
+    }}
+  ]
+}}
+
+Rules:
+- Mark is_shot_boundary true only if there is evidence of an actual edit or hard cut between the two frames.
+- Do not mark true for the same continuous take with camera movement, zoom, pan, tilt, dolly, focus change, subject motion, or reframing.
+- If the left and right frames plausibly belong to one uninterrupted recording, mark false.
+- If false, set new_shot_description to an empty string.
+- Confidence must be between 0 and 1.
+- No markdown, no explanations outside JSON.
+""".strip()
+
+        response = self.run_gemma_with_retry(
+            lambda: client.models.generate_content(
+                model=model_name,
+                contents=[prompt, contact_sheet],
+                config=types.GenerateContentConfig(
+                    system_instruction="You are a strict JSON vision validator.",
+                    thinking_config=types.ThinkingConfig(thinking_level="high"),
+                ),
+            ),
+            "Validating hard-cut candidates",
+            status_callback=status_callback,
+        )
+
+        payload = extract_json_payload(response.text)
+        raw_candidates = payload if isinstance(payload, list) else payload.get("candidates", [])
+        validated = {}
+        for raw in raw_candidates:
+            if not isinstance(raw, dict):
+                continue
+            candidate_id = str(raw.get("id", "")).strip()
+            if not candidate_id:
+                continue
+            raw_flag = raw.get("is_shot_boundary")
+            if isinstance(raw_flag, bool):
+                is_shot_boundary = raw_flag
+            else:
+                is_shot_boundary = str(raw_flag or "").strip().lower() in {
+                    "1",
+                    "true",
+                    "yes",
+                    "y",
+                }
+            try:
+                confidence = float(raw.get("confidence", 0.0) or 0.0)
+            except (TypeError, ValueError):
+                confidence = 0.0
+            validated[candidate_id] = {
+                "is_shot_boundary": is_shot_boundary,
+                "new_shot_description": str(
+                    raw.get("new_shot_description", "") or ""
+                ).strip(),
+                "confidence": max(0.0, min(1.0, confidence)),
+            }
+        return validated
+
+    def add_detected_shot_bookmarks(self, finalized_shots, clear_existing=False):
+        if clear_existing:
+            self.bookmarks = []
+            self.timeline.bookmarks.clear()
+            self.overview_timeline.bookmarks.clear()
+
+        existing_frames = {bookmark["frame"] for bookmark in self.bookmarks}
+        for shot in finalized_shots:
+            frame = int(shot["start_frame"])
+            if frame in existing_frames:
+                continue
+            timestamp = shot["start_timestamp"]
+            description = shot["description"].strip()
+            short_description = description[:48].rstrip()
+            if len(description) > 48:
+                short_description += "..."
+            name = f"Shot {shot['index']:03d} {timestamp} {short_description}".strip()
+            bookmark = {
+                "frame": frame,
+                "name": name,
+                "color": "#00a8ff",
+                "annotations": [],
+            }
+            self.bookmarks.append(bookmark)
+            self.timeline.add_bookmark(frame)
+            self.overview_timeline.add_bookmark(frame)
+            existing_frames.add(frame)
+
+        self.update_bookmark_list()
+
+    def write_shot_detection_outputs(
+        self,
+        output_folder,
+        prefix,
+        model_name,
+        fps,
+        start_frame,
+        end_frame,
+        finalized_shots,
+        chunk_analyses,
+        traditional_candidates,
+    ):
+        os.makedirs(output_folder, exist_ok=True)
+        prefix = sanitize_filename_part(prefix)
+        txt_path = os.path.join(output_folder, f"{prefix}_gemma_shots.txt")
+        json_path = os.path.join(output_folder, f"{prefix}_gemma_shots.json")
+
+        with open(txt_path, "w", encoding="utf-8") as handle:
+            for shot in finalized_shots:
+                handle.write(
+                    f"{shot['index']:03d}  {shot['start_timestamp']}  {shot['description']}\n"
+                )
+
+        payload = {
+            "source_name": self.get_loaded_source_name(),
+            "model": model_name,
+            "fps": fps,
+            "start_frame": start_frame,
+            "end_frame": end_frame,
+            "shots": finalized_shots,
+            "chunks": [
+                {
+                    "chunk_index": analysis.chunk.index,
+                    "start_frame": analysis.chunk.start_frame,
+                    "end_frame": analysis.chunk.end_frame,
+                    "start_timestamp": frame_to_timestamp(analysis.chunk.start_frame, fps),
+                    "end_timestamp": frame_to_timestamp(analysis.chunk.end_frame, fps),
+                    "duration_seconds": analysis.chunk.duration_seconds,
+                    "first_shot_signature": analysis.first_shot_signature,
+                    "last_shot_signature": analysis.last_shot_signature,
+                    "shots": [
+                        {
+                            "start_seconds": shot.start_seconds,
+                            "description": shot.description,
+                            "continues_from_previous": shot.continues_from_previous,
+                            "continues_to_next": shot.continues_to_next,
+                            "confidence": shot.confidence,
+                        }
+                        for shot in analysis.shots
+                    ],
+                }
+                for analysis in chunk_analyses
+            ],
+            "traditional_candidates": [
+                {
+                    "frame": candidate.frame,
+                    "timestamp": frame_to_timestamp(candidate.frame, fps),
+                    "score": candidate.score,
+                    "confidence": candidate.confidence,
+                    "kind": candidate.kind,
+                }
+                for candidate in traditional_candidates
+            ],
+        }
+
+        with open(json_path, "w", encoding="utf-8") as handle:
+            json.dump(payload, handle, indent=4)
+
+        return txt_path, json_path
+
+    def detect_shots_with_gemma(
+        self,
+        output_folder,
+        prefix,
+        model_name,
+        api_key,
+        start_frame,
+        end_frame,
+        add_bookmarks=True,
+        clear_existing=False,
+    ):
+        progress = QDialog(self)
+        progress.setWindowTitle("Gemma Shot Detection...")
+        progress.setFixedSize(460, 150)
+        layout = QVBoxLayout(progress)
+        status_label = QLabel("Preparing shot detection...")
+        status_label.setWordWrap(True)
+        layout.addWidget(status_label)
+        bar = QProgressBar()
+        bar.setRange(0, 100)
+        layout.addWidget(bar)
+        progress.show()
+
+        def update_progress(percent, message):
+            bar.setValue(max(0, min(100, int(percent))))
+            status_label.setText(message)
+            QApplication.processEvents()
+
+        fps = float(self.get_export_fps())
+        relative_chunks = plan_shot_analysis_chunks(end_frame - start_frame + 1, fps)
+        chunks = [
+            AnalysisChunk(
+                index=chunk.index,
+                start_frame=start_frame + chunk.start_frame,
+                end_frame=start_frame + chunk.end_frame,
+                fps=chunk.fps,
+            )
+            for chunk in relative_chunks
+        ]
+
+        try:
+            genai, _types, _errors = self.import_gemma_sdk()
+
+            update_progress(5, "Scanning the clip for traditional cut candidates...")
+
+            def traditional_progress(ratio):
+                update_progress(5 + (ratio * 15), "Scanning the clip for traditional cut candidates...")
+
+            traditional_candidates, _scores = self.scan_traditional_cut_candidates(
+                start_frame,
+                end_frame,
+                fps,
+                progress_callback=traditional_progress,
+            )
+
+            client = genai.Client(api_key=api_key) if api_key else genai.Client()
+            chunk_analyses = []
+            chunk_shot_groups = []
+
+            with tempfile.TemporaryDirectory(prefix="kf_gemma_shots_") as temp_dir:
+                for chunk_index, chunk in enumerate(chunks, start=1):
+                    progress_base = 20 + ((chunk_index - 1) / max(len(chunks), 1)) * 50
+
+                    update_progress(
+                        progress_base,
+                        f"Encoding chunk {chunk_index}/{len(chunks)} for Gemma...",
+                    )
+                    clip_path = os.path.join(
+                        temp_dir, f"gemma_chunk_{chunk_index:03d}.mp4"
+                    )
+                    self.write_analysis_clip(
+                        clip_path,
+                        chunk.start_frame,
+                        chunk.end_frame,
+                        fps,
+                        progress_callback=lambda ratio, base=progress_base: update_progress(
+                            base + (ratio * (10 / max(len(chunks), 1))),
+                            f"Encoding chunk {chunk_index}/{len(chunks)} for Gemma...",
+                        ),
+                    )
+
+                    analysis = self.analyze_chunk_with_gemma(
+                        client,
+                        model_name,
+                        clip_path,
+                        chunk,
+                        status_callback=lambda message, idx=chunk_index, total=len(chunks): update_progress(
+                            progress_base + 10,
+                            f"Chunk {idx}/{total}: {message}",
+                        ),
+                    )
+                    chunk_analyses.append(analysis)
+                    chunk_shot_groups.append(
+                        match_chunk_shots_to_candidates(analysis, traditional_candidates)
+                    )
+
+                update_progress(72, "Reconciling chunk seams so split shots are not double-counted...")
+
+                seam_rows = []
+                seam_context_lines = []
+                seam_window = max(2, int(round(fps * 0.5)))
+                for seam_index in range(1, len(chunk_shot_groups)):
+                    previous_group = chunk_shot_groups[seam_index - 1]
+                    next_group = chunk_shot_groups[seam_index]
+                    if not previous_group or not next_group:
+                        continue
+
+                    seam_frame = next_group[0].start_frame
+                    seam_rows.append(
+                        {
+                            "id": f"S{seam_index:02d}",
+                            "before_rgb": self.get_rgb_frame_array(
+                                max(start_frame, seam_frame - 1), max_dimension=640
+                            ),
+                            "after_rgb": self.get_rgb_frame_array(
+                                min(end_frame, seam_frame), max_dimension=640
+                            ),
+                            "before_timestamp": frame_to_timestamp(max(start_frame, seam_frame - 1), fps),
+                            "after_timestamp": frame_to_timestamp(min(end_frame, seam_frame), fps),
+                            "candidate_frame": seam_frame,
+                        }
+                    )
+                    seam_context_lines.append(
+                        f"S{seam_index:02d}: previous='{previous_group[-1].description}' next='{next_group[0].description}'"
+                    )
+
+                seam_validations = self.validate_candidate_rows_with_gemma(
+                    client,
+                    model_name,
+                    seam_rows,
+                    status_callback=lambda message: update_progress(76, message),
+                    prompt_context="Context:\n" + "\n".join(seam_context_lines) if seam_context_lines else "",
+                )
+
+                merged_shots = []
+                for group_index, group in enumerate(chunk_shot_groups):
+                    if not group:
+                        continue
+                    if not merged_shots:
+                        merged_shots.extend(group)
+                        continue
+
+                    current_first = group[0]
+                    previous_last = merged_shots[-1]
+                    seam_id = f"S{group_index:02d}"
+                    seam_validation = seam_validations.get(seam_id, {})
+                    seam_candidate = find_nearest_candidate(
+                        current_first.start_frame,
+                        traditional_candidates,
+                        seam_window,
+                    )
+                    should_merge = should_merge_boundary_duplicate(
+                        previous_last,
+                        current_first,
+                        boundary_same_shot=not seam_validation.get("is_shot_boundary", False),
+                        seam_candidate=seam_candidate,
+                    )
+                    if should_merge:
+                        previous_last.description = merge_shot_descriptions(
+                            previous_last.description,
+                            current_first.description,
+                        )
+                        previous_last.continues_to_next = (
+                            previous_last.continues_to_next or current_first.continues_to_next
+                        )
+                        if current_first.confidence is not None:
+                            previous_last.confidence = max(
+                                previous_last.confidence or 0.0,
+                                current_first.confidence,
+                            )
+                        merged_shots.extend(group[1:])
+                    else:
+                        merged_shots.extend(group)
+
+                update_progress(84, "Checking for strong cut candidates Gemma may have missed in the video chunks...")
+
+                matched_frames = {shot.start_frame for shot in merged_shots}
+                extra_candidate_rows = []
+                candidate_window = max(2, int(round(fps * 0.75)))
+                for candidate_index, candidate in enumerate(traditional_candidates, start=1):
+                    if candidate.confidence < 0.82:
+                        continue
+                    if any(abs(candidate.frame - frame) <= candidate_window for frame in matched_frames):
+                        continue
+                    extra_candidate_rows.append(
+                        {
+                            "id": f"C{candidate_index:03d}",
+                            "before_rgb": self.get_rgb_frame_array(
+                                max(start_frame, candidate.frame - 1), max_dimension=640
+                            ),
+                            "after_rgb": self.get_rgb_frame_array(
+                                min(end_frame, candidate.frame), max_dimension=640
+                            ),
+                            "before_timestamp": frame_to_timestamp(
+                                max(start_frame, candidate.frame - 1), fps
+                            ),
+                            "after_timestamp": frame_to_timestamp(
+                                min(end_frame, candidate.frame), fps
+                            ),
+                            "candidate_frame": candidate.frame,
+                            "candidate": candidate,
+                        }
+                    )
+
+                extra_confirmed_shots = []
+                if extra_candidate_rows:
+                    batch_size = 8
+                    for batch_index in range(0, len(extra_candidate_rows), batch_size):
+                        batch = extra_candidate_rows[batch_index : batch_index + batch_size]
+                        validated = self.validate_candidate_rows_with_gemma(
+                            client,
+                            model_name,
+                            batch,
+                            status_callback=lambda message, offset=batch_index: update_progress(
+                                84 + ((offset + len(batch)) / max(len(extra_candidate_rows), 1)) * 10,
+                                message,
+                            ),
+                        )
+                        for row in batch:
+                            result = validated.get(row["id"], {})
+                            if not result.get("is_shot_boundary"):
+                                continue
+                            description = result.get("new_shot_description", "").strip()
+                            if not description:
+                                description = "Additional short shot detected from a strong cut candidate."
+                            extra_confirmed_shots.append(
+                                DetectedShot(
+                                    start_frame=row["candidate_frame"],
+                                    description=description,
+                                    source="candidate_validation",
+                                    confidence=result.get("confidence"),
+                                )
+                            )
+
+                final_shots = merged_shots + extra_confirmed_shots
+                finalized = finalize_shot_ranges(final_shots, fps, end_frame)
+
+                update_progress(96, "Writing shot timestamp files...")
+                txt_path, json_path = self.write_shot_detection_outputs(
+                    output_folder,
+                    prefix,
+                    model_name,
+                    fps,
+                    start_frame,
+                    end_frame,
+                    finalized,
+                    chunk_analyses,
+                    traditional_candidates,
+                )
+
+                if add_bookmarks:
+                    update_progress(99, "Adding detected shot starts as bookmarks...")
+                    self.add_detected_shot_bookmarks(finalized, clear_existing=clear_existing)
+
+            update_progress(100, "Shot detection complete.")
+            self.remember_export_folder(output_folder)
+            QMessageBox.information(
+                self,
+                "Gemma Shot Detection Complete",
+                f"Detected {len(finalized)} shot(s).\n\n"
+                f"Timestamps: {txt_path}\n"
+                f"JSON: {json_path}",
+            )
+        except Exception as e:
+            QMessageBox.critical(self, "Shot Detection Error", str(e))
+        finally:
+            progress.close()
+
     def get_export_fps(self):
         fps = (
             self.project.video_fps
@@ -1633,18 +2842,24 @@ class MainWindow(QMainWindow):
         return arr[:, : width * 3].reshape((height, width, 3))
 
     def write_mp4_file(
-        self, filepath, frame_numbers, quality, preset="fast", progress_callback=None
+        self, filepath, frame_numbers, quality, preset="fast", progress_callback=None, fps=None
     ):
         import imageio
 
         if not filepath.endswith(".mp4"):
             filepath += ".mp4"
 
+        output_dir = os.path.dirname(filepath)
+        if output_dir:
+            os.makedirs(output_dir, exist_ok=True)
+
+        effective_fps = fps if fps is not None else self.get_export_fps()
+
         writer = imageio.get_writer(
             filepath,
             format="FFMPEG",
             mode="I",
-            fps=self.get_export_fps(),
+            fps=effective_fps,
             codec="libx264",
             macro_block_size=None,
             quality=None,
@@ -1653,12 +2868,19 @@ class MainWindow(QMainWindow):
 
         try:
             total = len(frame_numbers)
+            last_source_frame = None
+            last_rgb_frame = None
             for output_index, source_frame in enumerate(frame_numbers, start=1):
-                pixmap = self.load_frame_data(source_frame)
-                if pixmap is None:
-                    raise ValueError(f"Could not load frame {source_frame} for export.")
+                if source_frame != last_source_frame or last_rgb_frame is None:
+                    pixmap = self.load_frame_data(source_frame)
+                    if pixmap is None:
+                        raise ValueError(
+                            f"Could not load frame {source_frame} for export."
+                        )
+                    last_rgb_frame = self.pixmap_to_rgb_array(pixmap)
+                    last_source_frame = source_frame
 
-                writer.append_data(self.pixmap_to_rgb_array(pixmap))
+                writer.append_data(last_rgb_frame)
 
                 if progress_callback:
                     progress_callback(output_index, total, source_frame)
@@ -2069,10 +3291,10 @@ class ExportDialog(QDialog):
         self.output_folder = QLineEdit(parent.get_default_export_folder())
         folder_layout = QHBoxLayout()
         folder_layout.addWidget(self.output_folder)
-        browse_btn = QPushButton("...")
-        browse_btn.setFixedWidth(30)
-        browse_btn.clicked.connect(self.browse_output_folder)
-        folder_layout.addWidget(browse_btn)
+        self.browse_output_folder_btn = QPushButton("...")
+        self.browse_output_folder_btn.setFixedWidth(30)
+        self.browse_output_folder_btn.clicked.connect(self.browse_output_folder)
+        folder_layout.addWidget(self.browse_output_folder_btn)
         layout.addRow("Output Folder:", folder_layout)
 
         self.filename_pattern = QLineEdit("frame_####.png")
@@ -2152,17 +3374,24 @@ class ExportDialog(QDialog):
 class ExportBookmarksDialog(QDialog):
     def __init__(self, parent):
         super().__init__(parent)
-        self.setWindowTitle("Export Bookmarks as Images")
+        self.parent_window = parent
+        self.setWindowTitle("Export Bookmarks")
         self.setModal(True)
-        self.setMinimumWidth(380)
+        self.setMinimumWidth(420)
 
         layout = QFormLayout(self)
 
         info = QLabel(
-            f"{len(parent.bookmarks)} bookmark(s) will export at source resolution."
+            f"{len(parent.bookmarks)} bookmark(s) can export as an image sequence or a stitched video."
         )
         info.setWordWrap(True)
         layout.addRow(info)
+
+        self.mode_combo = QComboBox()
+        self.mode_combo.addItem("Image Sequence", "images")
+        self.mode_combo.addItem("Video", "video")
+        self.mode_combo.currentIndexChanged.connect(self.update_mode_state)
+        layout.addRow("Export Type:", self.mode_combo)
 
         self.output_folder = QLineEdit(parent.get_default_export_folder())
         folder_layout = QHBoxLayout()
@@ -2192,6 +3421,74 @@ class ExportBookmarksDialog(QDialog):
         quality_layout.addWidget(self.jpeg_quality)
         layout.addRow("JPEG:", quality_layout)
 
+        default_name = build_bookmark_video_export_filename(
+            parent.get_loaded_source_name(), ".mp4"
+        )
+        default_path = os.path.join(parent.get_default_export_folder(), default_name)
+        self.output_path = QLineEdit(default_path)
+        output_layout = QHBoxLayout()
+        output_layout.addWidget(self.output_path)
+        self.browse_output_path_btn = QPushButton("...")
+        self.browse_output_path_btn.setFixedWidth(30)
+        self.browse_output_path_btn.clicked.connect(self.browse_output_path)
+        output_layout.addWidget(self.browse_output_path_btn)
+        layout.addRow("Output File:", output_layout)
+
+        self.hold_spinbox = QSpinBox()
+        self.hold_spinbox.setRange(1, 9999)
+        self.hold_spinbox.setValue(1)
+        self.hold_spinbox.setSuffix(" frame(s)")
+        self.hold_spinbox.valueChanged.connect(self.update_duration_hint)
+
+        self.duration_hint = QLabel()
+        self.duration_hint.setWordWrap(True)
+        self.duration_hint.setStyleSheet("color: gray; font-size: 10px;")
+        hold_layout = QVBoxLayout()
+        hold_layout.addWidget(self.hold_spinbox)
+        hold_layout.addWidget(self.duration_hint)
+        layout.addRow("Hold Per Bookmark:", hold_layout)
+
+        self.fps_spinbox = QSpinBox()
+        self.fps_spinbox.setRange(1, 120)
+        self.fps_spinbox.setValue(parent.get_export_fps())
+        self.fps_spinbox.setSuffix(" fps")
+        self.fps_spinbox.valueChanged.connect(self.update_duration_hint)
+        fps_hint = QLabel("Frame rate of the exported video.")
+        fps_hint.setStyleSheet("color: gray; font-size: 10px;")
+        fps_layout = QVBoxLayout()
+        fps_layout.addWidget(self.fps_spinbox)
+        fps_layout.addWidget(fps_hint)
+        layout.addRow("Export FPS:", fps_layout)
+
+        self.quality_slider = QSlider(Qt.Orientation.Horizontal)
+        self.quality_slider.setRange(1, 10)
+        self.quality_slider.setValue(5)
+        self.quality_slider.setTickPosition(QSlider.TickPosition.TicksBelow)
+        self.quality_slider.setTickInterval(1)
+
+        self.quality_label = QLabel("Quality: 5 (Balanced)")
+        self.quality_slider.valueChanged.connect(self.update_video_quality_label)
+
+        video_quality_layout = QVBoxLayout()
+        video_quality_layout.addWidget(self.quality_label)
+        video_quality_layout.addWidget(self.quality_slider)
+        video_quality_hint = QLabel(
+            "Lower quality = Smaller file size.\n10 is near lossless."
+        )
+        video_quality_hint.setStyleSheet("color: gray; font-size: 10px;")
+        video_quality_layout.addWidget(video_quality_hint)
+        layout.addRow("Video Compression:", video_quality_layout)
+
+        self.speed_combo = QComboBox()
+        self.speed_combo.addItems(["ultrafast", "fast", "medium", "slow"])
+        self.speed_combo.setCurrentIndex(1)
+        speed_hint = QLabel("'ultrafast' exports quickly but file is slightly larger.")
+        speed_hint.setStyleSheet("color: gray; font-size: 10px;")
+        speed_layout = QVBoxLayout()
+        speed_layout.addWidget(self.speed_combo)
+        speed_layout.addWidget(speed_hint)
+        layout.addRow("Video Speed:", speed_layout)
+
         buttons = QDialogButtonBox(
             QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel
         )
@@ -2200,14 +3497,30 @@ class ExportBookmarksDialog(QDialog):
         layout.addRow(buttons)
 
         self.update_quality_state(self.format_combo.currentText())
+        self.update_video_quality_label(self.quality_slider.value())
+        self.update_duration_hint()
+        self.update_mode_state()
 
     def browse_output_folder(self):
         folder = QFileDialog.getExistingDirectory(self, "Select Output Folder")
         if folder:
             self.output_folder.setText(folder)
 
+    def browse_output_path(self):
+        filepath, _ = QFileDialog.getSaveFileName(
+            self,
+            "Export Bookmarks as Video",
+            self.output_path.text().strip(),
+            "MP4 Video (*.mp4)",
+        )
+        if filepath:
+            self.output_path.setText(ensure_extension(filepath, ".mp4"))
+
     def get_format_name(self):
         return self.format_combo.currentText()
+
+    def is_video_mode(self):
+        return self.mode_combo.currentData() == "video"
 
     def update_quality_label(self, value):
         self.jpeg_quality_label.setText(f"JPEG Quality: {value}")
@@ -2216,6 +3529,170 @@ class ExportBookmarksDialog(QDialog):
         is_jpeg = format_name == "JPEG"
         self.jpeg_quality.setEnabled(is_jpeg)
         self.jpeg_quality_label.setEnabled(is_jpeg)
+
+    def update_duration_hint(self, _value=None):
+        fps = self.fps_spinbox.value()
+        hold_frames = max(1, self.hold_spinbox.value())
+        total_output_frames = hold_frames * len(self.parent_window.bookmarks)
+        total_duration = total_output_frames / fps
+        self.duration_hint.setText(
+            f"Each bookmark held for {hold_frames} frame(s) at {fps} fps. "
+            f"Estimated reel length: {total_duration:.2f} seconds."
+        )
+
+    def update_video_quality_label(self, val):
+        if val <= 3:
+            desc = "Small File"
+        elif val <= 6:
+            desc = "Balanced"
+        else:
+            desc = "High Quality"
+        self.quality_label.setText(f"Quality: {val} ({desc})")
+
+    def update_mode_state(self):
+        image_mode = not self.is_video_mode()
+
+        self.output_folder.setEnabled(image_mode)
+        self.browse_output_folder_btn.setEnabled(image_mode)
+        self.filename_prefix.setEnabled(image_mode)
+        self.format_combo.setEnabled(image_mode)
+        self.update_quality_state(self.format_combo.currentText() if image_mode else "")
+        if not image_mode:
+            self.jpeg_quality.setEnabled(False)
+            self.jpeg_quality_label.setEnabled(False)
+
+        self.output_path.setEnabled(not image_mode)
+        self.browse_output_path_btn.setEnabled(not image_mode)
+        self.hold_spinbox.setEnabled(not image_mode)
+        self.fps_spinbox.setEnabled(not image_mode)
+        self.quality_slider.setEnabled(not image_mode)
+        self.speed_combo.setEnabled(not image_mode)
+
+
+class ExportBookmarksVideoDialog(QDialog):
+    def __init__(self, parent):
+        super().__init__(parent)
+        self.parent_window = parent
+        self.setWindowTitle("Export Bookmarks as Video")
+        self.setModal(True)
+        self.setMinimumWidth(400)
+
+        layout = QFormLayout(self)
+
+        info = QLabel(
+            f"{len(parent.bookmarks)} bookmark(s) will stitch in timeline order."
+        )
+        info.setWordWrap(True)
+        layout.addRow(info)
+
+        default_name = build_bookmark_video_export_filename(
+            parent.get_loaded_source_name(), ".mp4"
+        )
+        default_path = os.path.join(parent.get_default_export_folder(), default_name)
+        self.output_path = QLineEdit(default_path)
+
+        output_layout = QHBoxLayout()
+        output_layout.addWidget(self.output_path)
+        browse_btn = QPushButton("...")
+        browse_btn.setFixedWidth(30)
+        browse_btn.clicked.connect(self.browse_output_path)
+        output_layout.addWidget(browse_btn)
+        layout.addRow("Output File:", output_layout)
+
+        self.hold_spinbox = QSpinBox()
+        self.hold_spinbox.setRange(1, 9999)
+        self.hold_spinbox.setValue(1)
+        self.hold_spinbox.setSuffix(" frame(s)")
+        self.hold_spinbox.valueChanged.connect(self.update_duration_hint)
+
+        self.duration_hint = QLabel()
+        self.duration_hint.setWordWrap(True)
+        self.duration_hint.setStyleSheet("color: gray; font-size: 10px;")
+
+        hold_layout = QVBoxLayout()
+        hold_layout.addWidget(self.hold_spinbox)
+        hold_layout.addWidget(self.duration_hint)
+        layout.addRow("Hold Per Bookmark:", hold_layout)
+
+        self.fps_spinbox = QSpinBox()
+        self.fps_spinbox.setRange(1, 120)
+        self.fps_spinbox.setValue(parent.get_export_fps())
+        self.fps_spinbox.setSuffix(" fps")
+        self.fps_spinbox.valueChanged.connect(self.update_duration_hint)
+        fps_hint = QLabel("Frame rate of the exported video.")
+        fps_hint.setStyleSheet("color: gray; font-size: 10px;")
+        fps_layout = QVBoxLayout()
+        fps_layout.addWidget(self.fps_spinbox)
+        fps_layout.addWidget(fps_hint)
+        layout.addRow("Export FPS:", fps_layout)
+
+        self.quality_slider = QSlider(Qt.Orientation.Horizontal)
+        self.quality_slider.setRange(1, 10)
+        self.quality_slider.setValue(5)
+        self.quality_slider.setTickPosition(QSlider.TickPosition.TicksBelow)
+        self.quality_slider.setTickInterval(1)
+
+        self.quality_label = QLabel("Quality: 5 (Balanced)")
+        self.quality_slider.valueChanged.connect(self.update_quality_label)
+
+        quality_layout = QVBoxLayout()
+        quality_layout.addWidget(self.quality_label)
+        quality_layout.addWidget(self.quality_slider)
+
+        quality_hint = QLabel("Lower quality = Smaller file size.\n10 is near lossless.")
+        quality_hint.setStyleSheet("color: gray; font-size: 10px;")
+        quality_layout.addWidget(quality_hint)
+        layout.addRow("Compression:", quality_layout)
+
+        self.speed_combo = QComboBox()
+        self.speed_combo.addItems(["ultrafast", "fast", "medium", "slow"])
+        self.speed_combo.setCurrentIndex(1)
+        speed_hint = QLabel("'ultrafast' exports quickly but file is slightly larger.")
+        speed_hint.setStyleSheet("color: gray; font-size: 10px;")
+        speed_layout = QVBoxLayout()
+        speed_layout.addWidget(self.speed_combo)
+        speed_layout.addWidget(speed_hint)
+        layout.addRow("Speed:", speed_layout)
+
+        buttons = QDialogButtonBox(
+            QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel
+        )
+        buttons.accepted.connect(self.accept)
+        buttons.rejected.connect(self.reject)
+        layout.addRow(buttons)
+
+        self.update_quality_label(self.quality_slider.value())
+        self.update_duration_hint(self.hold_spinbox.value())
+
+    def browse_output_path(self):
+        filepath, _ = QFileDialog.getSaveFileName(
+            self,
+            "Export Bookmarks as Video",
+            self.output_path.text().strip(),
+            "MP4 Video (*.mp4)",
+        )
+        if filepath:
+            self.output_path.setText(ensure_extension(filepath, ".mp4"))
+
+    def update_duration_hint(self, _value=None):
+        fps = self.fps_spinbox.value()
+        hold_frames = max(1, self.hold_spinbox.value())
+        total_output_frames = hold_frames * len(self.parent_window.bookmarks)
+        total_duration = total_output_frames / fps
+        self.duration_hint.setText(
+            f"Each bookmark held for {hold_frames} frame(s) at {fps} fps. "
+            f"Estimated reel length: {total_duration:.2f} seconds."
+        )
+
+    def update_quality_label(self, val):
+        if val <= 3:
+            desc = "Small File"
+        elif val <= 6:
+            desc = "Balanced"
+        else:
+            desc = "High Quality"
+
+        self.quality_label.setText(f"Quality: {val} ({desc})")
 
 
 class ExportMp4Dialog(QDialog):
@@ -2284,6 +3761,127 @@ class ExportMp4Dialog(QDialog):
             desc = "High Quality"
 
         self.quality_label.setText(f"Quality: {val} ({desc})")
+
+
+class GemmaShotDetectionDialog(QDialog):
+    def __init__(self, parent):
+        super().__init__(parent)
+        self.parent_window = parent
+        self.setWindowTitle("Detect Shots with Gemma")
+        self.setModal(True)
+        self.setMinimumWidth(460)
+
+        layout = QFormLayout(self)
+
+        self.plan_info = QLabel()
+        self.plan_info.setWordWrap(True)
+        layout.addRow(self.plan_info)
+
+        default_output_folder = parent.get_default_export_folder()
+        self.output_folder = QLineEdit(default_output_folder)
+        folder_layout = QHBoxLayout()
+        folder_layout.addWidget(self.output_folder)
+        browse_btn = QPushButton("...")
+        browse_btn.setFixedWidth(30)
+        browse_btn.clicked.connect(self.browse_output_folder)
+        folder_layout.addWidget(browse_btn)
+        layout.addRow("Output Folder:", folder_layout)
+
+        default_prefix = sanitize_filename_part(parent.get_loaded_source_name())
+        self.filename_prefix = QLineEdit(f"{default_prefix}_shots")
+        layout.addRow("Filename Prefix:", self.filename_prefix)
+
+        self.api_key = QLineEdit("")
+        self.api_key.setEchoMode(QLineEdit.EchoMode.Password)
+        self.api_key.setPlaceholderText(
+            "Optional here if GOOGLE_API_KEY or GEMINI_API_KEY is set in .env"
+        )
+        api_hint = QLabel(
+            "Gemma only. The key is used for this run; leaving it blank uses GOOGLE_API_KEY or GEMINI_API_KEY from .env."
+        )
+        api_hint.setWordWrap(True)
+        api_hint.setStyleSheet("color: gray; font-size: 10px;")
+        api_layout = QVBoxLayout()
+        api_layout.addWidget(self.api_key)
+        api_layout.addWidget(api_hint)
+        layout.addRow("Google API Key:", api_layout)
+
+        self.model_combo = QComboBox()
+        self.model_combo.addItem("Gemma 4 31B Instruct", "gemma-4-31b-it")
+        self.model_combo.addItem("Gemma 4 26B A4B Instruct", "gemma-4-26b-a4b-it")
+        model_hint = QLabel("Video understanding stays on Gemma only. No Gemini model fallback is used.")
+        model_hint.setWordWrap(True)
+        model_hint.setStyleSheet("color: gray; font-size: 10px;")
+        model_layout = QVBoxLayout()
+        model_layout.addWidget(self.model_combo)
+        model_layout.addWidget(model_hint)
+        layout.addRow("Model:", model_layout)
+
+        self.start_spinbox = QSpinBox()
+        self.start_spinbox.setRange(0, parent.total_frames - 1)
+        self.start_spinbox.setValue(0)
+        self.start_spinbox.valueChanged.connect(self.update_plan_preview)
+        layout.addRow("Start Frame:", self.start_spinbox)
+
+        self.end_spinbox = QSpinBox()
+        self.end_spinbox.setRange(0, parent.total_frames - 1)
+        self.end_spinbox.setValue(parent.total_frames - 1)
+        self.end_spinbox.valueChanged.connect(self.update_plan_preview)
+        layout.addRow("End Frame:", self.end_spinbox)
+
+        self.add_bookmarks_checkbox = QCheckBox("Add detected shots as bookmarks")
+        self.add_bookmarks_checkbox.setChecked(True)
+        self.add_bookmarks_checkbox.toggled.connect(self.update_bookmark_options)
+        layout.addRow("Bookmarks:", self.add_bookmarks_checkbox)
+
+        self.clear_bookmarks_checkbox = QCheckBox("Clear existing bookmarks first")
+        self.clear_bookmarks_checkbox.setChecked(False)
+        layout.addRow("", self.clear_bookmarks_checkbox)
+
+        strategy_hint = QLabel(
+            f"The detector uses a hybrid pipeline: {SHOT_ANALYSIS_CHUNK_SECONDS:.0f}-second Gemma video chunks for semantic shot descriptions, "
+            "dense traditional cut scoring for frame-accurate candidates, and Gemma image checks to reconcile seam duplicates and missed strong cuts."
+        )
+        strategy_hint.setWordWrap(True)
+        strategy_hint.setStyleSheet("color: gray; font-size: 10px;")
+        layout.addRow(strategy_hint)
+
+        buttons = QDialogButtonBox(
+            QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel
+        )
+        buttons.accepted.connect(self.accept)
+        buttons.rejected.connect(self.reject)
+        layout.addRow(buttons)
+
+        self.update_bookmark_options()
+        self.update_plan_preview()
+
+    def browse_output_folder(self):
+        folder = QFileDialog.getExistingDirectory(self, "Select Output Folder")
+        if folder:
+            self.output_folder.setText(folder)
+
+    def update_bookmark_options(self):
+        enabled = self.add_bookmarks_checkbox.isChecked()
+        self.clear_bookmarks_checkbox.setEnabled(enabled)
+        if not enabled:
+            self.clear_bookmarks_checkbox.setChecked(False)
+
+    def update_plan_preview(self, *_args):
+        start_frame = self.start_spinbox.value()
+        end_frame = self.end_spinbox.value()
+        if start_frame > end_frame:
+            self.plan_info.setText("Invalid frame range: Start > End")
+            return
+
+        fps = float(self.parent_window.get_export_fps())
+        total_frames = end_frame - start_frame + 1
+        chunks = plan_shot_analysis_chunks(total_frames, fps)
+        seconds = total_frames / max(fps, 1e-6)
+        self.plan_info.setText(
+            f"{total_frames} frame(s) / {seconds:.2f} second(s) will be analyzed as "
+            f"{len(chunks)} Gemma chunk(s) of up to {SHOT_ANALYSIS_CHUNK_SECONDS:.0f} seconds each."
+        )
 
 
 class WanPreparationDialog(QDialog):

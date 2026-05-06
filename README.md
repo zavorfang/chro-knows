@@ -4,7 +4,7 @@
 
 **Project Name**: KFPlayer  
 **Type**: Desktop Application (Animation Review Tool)  
-**Core Feature**: A minimal, fast animation review player for animators. Load videos and image sequences, scrub with frame accuracy, set bookmarks, export compressed MP4 clips, and export WAN 2.2-friendly chunked MP4s.  
+**Core Feature**: A minimal, fast animation review player for animators. Load videos and image sequences, scrub with frame accuracy, set bookmarks, export compressed MP4 clips, export bookmarked frames as a stitched MP4 reel, and export WAN 2.2-friendly chunked MP4s.  
 **Target Users**: Animators and reviewers who need a lightweight, high-performance alternative to bloated media players.
 
 ## 2. UI/UX Specification
@@ -81,6 +81,7 @@ The application uses a vertical `QSplitter` to allow user-adjustable scaling of 
 - **MP4 Export**: H.264 export with integrated Quality and Speed control.
 - **Compression**: User-selectable Quality (1-10) mapping to FFMPEG CRF.
 - **Performance**: Speed Presets (**ultrafast**, **fast**, **medium**, **slow**) to optimize encoding time.
+- **Bookmark Reel Export**: Export all bookmarks as a stitched MP4 in timeline order, with a configurable hold duration per bookmark.
 - **WAN 2.2 Chunk Export**: Export long videos as multiple MP4 chunks tailored to WAN-safe frame counts.
 - **Chunk Controls**: User-selectable chunk size with WAN-safe snapping and optional chunk overlap.
 - **Tail Handling**: Rebalance the last two chunks to avoid extremely short trailer clips, and only pad the final chunk when required.
@@ -106,6 +107,7 @@ The application uses a vertical `QSplitter` to allow user-adjustable scaling of 
 - **Codec**: `libx264` (H.264) via FFMPEG backend.
 - **Compression**: User-selectable CRF (Constant Rate Factor) ranging from 15 (High Quality) to 35 (Small Size).
 - **Speed Presets**: FFMPEG presets (**ultrafast**, **fast**, **medium**, **slow**) to balance encoding time and file efficiency.
+- **Bookmark Video Behavior**: Bookmark reels reuse the same H.264 pipeline, repeating each bookmarked frame for the configured hold duration.
 
 ### 4.3 WAN Export Rules
 - **WAN-Safe Frame Counts**: Valid WAN lengths follow the pattern `(x * 4) + 1`.

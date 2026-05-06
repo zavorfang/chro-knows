@@ -2,12 +2,35 @@ import sys
 import os
 
 
+def load_env_file(filepath):
+    if not os.path.exists(filepath):
+        return
+
+    with open(filepath, "r", encoding="utf-8") as handle:
+        for raw_line in handle:
+            line = raw_line.strip()
+            if not line or line.startswith("#") or "=" not in line:
+                continue
+
+            key, value = line.split("=", 1)
+            key = key.strip()
+            value = value.strip()
+            if not key:
+                continue
+
+            if value and value[0] == value[-1] and value[0] in {"'", '"'}:
+                value = value[1:-1]
+
+            os.environ[key] = value
+
+
 def main():
     from PyQt6.QtWidgets import QApplication
     from PyQt6.QtCore import Qt
     
     os.chdir(os.path.dirname(os.path.abspath(__file__)))
     sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+    load_env_file(os.path.join(os.getcwd(), ".env"))
     
     from ui_main import MainWindow
     

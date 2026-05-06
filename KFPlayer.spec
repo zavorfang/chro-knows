@@ -2,7 +2,7 @@
 
 from pathlib import Path
 
-from PyInstaller.utils.hooks import collect_data_files
+from PyInstaller.utils.hooks import collect_data_files, collect_submodules
 
 
 ROOT = Path(__file__).resolve().parent
@@ -13,6 +13,7 @@ hiddenimports = [
     "imageio.plugins.ffmpeg",
     "imageio_ffmpeg",
 ]
+hiddenimports += collect_submodules("google.genai")
 
 excludes = [
     "torch",

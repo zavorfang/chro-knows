@@ -24,3 +24,5 @@ dist/
 # OS Generated Files
 .DS_Store
 Thumbs.db
+resources/analyze_a_video_summarization.py
+resources/gemma_4_api_doc.md

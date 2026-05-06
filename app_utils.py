@@ -121,3 +121,8 @@ def build_bookmark_export_filename(prefix, bookmark_index, frame_num, bookmark_n
         f"{prefix}_bookmark_{bookmark_index:03d}_"
         f"f{frame_num + 1:04d}_{bookmark_name}{extension}"
     )
+
+
+def build_bookmark_video_export_filename(prefix, extension):
+    prefix = sanitize_filename_part(prefix)
+    return f"{prefix}_bookmarks{extension}"

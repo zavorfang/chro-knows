@@ -6,7 +6,7 @@ This document is the definitive technical summary of the project's current imple
 
 - **App Name**: `KFPlayer` (UI title: `Keyframe Pro Lite`).
 - **Tech Stack**: Python 3.x, PyQt6, OpenCV (`cv2`), `imageio`, `numpy`.
-- **Core Purpose**: A lightweight, high-performance animation review tool for scrubbing video/image sequences, bookmarking, and specialized "Wan" preparation.
+- **Core Purpose**: A lightweight, high-performance animation review tool for scrubbing video/image sequences, bookmarking, exporting bookmark stills or stitched bookmark MP4 reels, and specialized "Wan" preparation.
 
 ## 2. The "Wan Preparation" Feature (Core Logic)
 
@@ -64,6 +64,7 @@ The most complex part of the app is the **Wan Preparation** tool. It prepares vi
 
 ## 5. Known Implementation Details
 - Uses **OpenCV** for reading, **imageio** for writing.
+- Bookmark video export reuses the existing H.264 writer and repeats each bookmarked frame for a user-configurable hold (in frames, default 1) at a user-configurable export FPS (default 24).
 - Memory monitoring via `psutil`.
 - Grid images are **95% quality JPEGs**.
 

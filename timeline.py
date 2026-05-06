@@ -5,18 +5,21 @@ from PyQt6.QtGui import QPainter, QColor, QPen, QBrush, QPixmap, QMouseEvent, QF
 
 class TimelineWidget(QWidget):
     frame_selected = pyqtSignal(int)
+    bookmark_hovered = pyqtSignal(int)
     
     def __init__(self, parent=None):
         super().__init__(parent)
         self.setMinimumHeight(120)
         self.setMaximumHeight(200)
         self.setStyleSheet("background-color: #2a2a2a;")
+        self.setMouseTracking(True)
         
         self.total_frames = 0
         self.current_frame = 0
         self.playhead = 0
         self.thumbnails = {}
         self.bookmarks = set()
+        self.hovered_bookmark = -1
         
         self.thumbnail_size = 64
         self.frame_width = 8
@@ -46,6 +49,22 @@ class TimelineWidget(QWidget):
         if frame in self.bookmarks:
             self.bookmarks.remove(frame)
             self.update()
+
+    def _bookmark_from_pos(self, pos):
+        frame_offset = 50
+        if pos.y() < 0 or pos.y() > 24:
+            return -1
+        for bookmark_frame in self.bookmarks:
+            bookmark_x = frame_offset + bookmark_frame * self.frame_width
+            if abs(pos.x() - bookmark_x) <= 6:
+                return bookmark_frame
+        return -1
+
+    def _set_hovered_bookmark(self, frame):
+        if frame == self.hovered_bookmark:
+            return
+        self.hovered_bookmark = frame
+        self.bookmark_hovered.emit(frame)
     
     def paintEvent(self, event):
         painter = QPainter(self)
@@ -150,10 +169,16 @@ class TimelineWidget(QWidget):
             self.playhead = frame
             self.frame_selected.emit(frame)
             self.update()
+        else:
+            self._set_hovered_bookmark(self._bookmark_from_pos(event.pos()))
     
     def mouseReleaseEvent(self, event):
         if event.button() == Qt.MouseButton.LeftButton:
             self.dragging_playhead = False
+
+    def leaveEvent(self, event):
+        self._set_hovered_bookmark(-1)
+        super().leaveEvent(event)
     
     def wheelEvent(self, event):
         if event.modifiers() == Qt.KeyboardModifier.ControlModifier:
@@ -170,12 +195,14 @@ class TimelineWidget(QWidget):
 class OverviewTimelineWidget(QWidget):
     """Thin global navigation bar representing the full video length."""
     frame_selected = pyqtSignal(int)
+    bookmark_hovered = pyqtSignal(int)
     
     def __init__(self, parent=None):
         super().__init__(parent)
         self.setFixedHeight(28)
         self.setMinimumWidth(100)
         self.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.setMouseTracking(True)
         
         self.total_frames = 0
         self.playhead = 0
@@ -183,6 +210,7 @@ class OverviewTimelineWidget(QWidget):
         self.in_point = None
         self.out_point = None
         self._dragging = False
+        self.hovered_bookmark = -1
     
     def set_total_frames(self, frames):
         self.total_frames = frames
@@ -199,6 +227,12 @@ class OverviewTimelineWidget(QWidget):
     def remove_bookmark(self, frame):
         self.bookmarks.discard(frame)
         self.update()
+
+    def _set_hovered_bookmark(self, frame):
+        if frame == self.hovered_bookmark:
+            return
+        self.hovered_bookmark = frame
+        self.bookmark_hovered.emit(frame)
     
     def _frame_from_x(self, x):
         if self.total_frames <= 0:
@@ -214,6 +248,15 @@ class OverviewTimelineWidget(QWidget):
         margin = 4
         usable = self.width() - margin * 2
         return margin + (frame / (self.total_frames - 1)) * usable
+
+    def _bookmark_from_pos(self, pos):
+        if self.total_frames <= 0:
+            return -1
+        for bookmark_frame in self.bookmarks:
+            bookmark_x = self._x_from_frame(bookmark_frame)
+            if abs(pos.x() - bookmark_x) <= 4:
+                return bookmark_frame
+        return -1
     
     def paintEvent(self, event):
         if self.total_frames <= 0:
@@ -267,7 +310,13 @@ class OverviewTimelineWidget(QWidget):
             self.playhead = frame
             self.frame_selected.emit(frame)
             self.update()
+        else:
+            self._set_hovered_bookmark(self._bookmark_from_pos(event.pos()))
     
     def mouseReleaseEvent(self, event):
         if event.button() == Qt.MouseButton.LeftButton:
             self._dragging = False
+
+    def leaveEvent(self, event):
+        self._set_hovered_bookmark(-1)
+        super().leaveEvent(event)

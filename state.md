@@ -1,77 +1,117 @@
 # KFPlayer Project State
 
-This document is the definitive technical summary of the project's current implementation. It supersedes the high-level goals in [README.md](README.md).
+This document is the definitive technical summary of the project's current implementation. It supersedes the higher-level goals in [README.md](README.md).
 
 ## 1. Project Summary
 
 - **App Name**: `KFPlayer` (UI title: `Keyframe Pro Lite`).
-- **Tech Stack**: Python 3.x, PyQt6, OpenCV (`cv2`), `imageio`, `numpy`.
-- **Core Purpose**: A lightweight, high-performance animation review tool for scrubbing video/image sequences, bookmarking, exporting bookmark stills or stitched bookmark MP4 reels, and specialized "Wan" preparation.
+- **Tech Stack**: Python 3.x, PyQt6, OpenCV (`cv2`), imageio, Pillow, numpy, psutil, Google GenAI SDK (`google-genai`) for Gemma integration.
+- **Core Purpose**: A lightweight animation review tool for scrubbing video/image sequences, bookmarking, exporting stills and video, preparing WAN-safe chunks, and detecting hard-cut shot boundaries with Gemma 4 plus traditional cut analysis.
 
-## 2. The "Wan Preparation" Feature (Core Logic)
+## 2. Current Major Features
 
-The most complex part of the app is the **Wan Preparation** tool. It prepares video chunks and visual grid sheets for machine learning or animation review workflows.
+### 2.1 Playback / Review
+- Supports videos and image sequences.
+- Dual timeline system:
+  - `OverviewTimelineWidget`: thin full-length navigation bar.
+  - `TimelineWidget`: scrollable thumbnail timeline.
+- Frame-accurate seeking, pan/zoom viewer, looping, playback speed control.
 
-### 2.1 Chunking Rules (`wan_chunks.py`)
-- **WAN-Safe Lengths**: All chunks must have a frame count following `(x * 4) + 1` (e.g., 1, 5, 9, 13, 85, 89, 93).
-- **Snapping**: User-requested chunk sizes are snapped **down** to the nearest safe value.
-- **Tail Handling**: If the final few frames would create a "tiny" trailer, the logic rebalances the last two chunks to ensure both are substantial.
-- **Padding**: Only the **final chunk** in an export is padded (by repeating the last frame within the selected range) to reach a WAN-safe length. Intermediate chunks are never padded. The frame range is clamped to the user's selected end frame — padding never reads frames beyond the selected shot boundary.
-- **Overlap Rules**: Overlap is optional (current range 4..32). It is modeled by moving the next chunk backward so it shares frames with the previous chunk (i.e., overlap happens at the start of a later chunk and at the end of the earlier chunk). Overlap changes the stride, meaning chunk counts and final distribution may change.
+### 2.2 Bookmarking
+- Bookmarks are stored as frame-indexed entries with name/color metadata.
+- The bookmark panel now includes:
+  - `+ Add Bookmark` / `- Remove Bookmark` contextual button.
+  - `Clear Bookmarks` button for deleting all bookmarks at once.
+- Hovering a bookmark marker on either timeline changes the main bookmark button into a remove action for that hovered bookmark.
+- Right-click bookmark context menu supports exporting a single bookmark image, exporting bookmarks, deleting one bookmark, and deleting all bookmarks.
 
-### 2.2 Example Behaviors
-- **Snapping**: `chunk size 88` becomes `85`.
-- **Short Clips**: A `10`-frame clip becomes one chunk padded to `13`.
-- **Tail Balancing**: A clip that would end as `85, 85, 85, 5` rebalances the last two chunks instead of leaving a tiny trailer.
-- **258 Frames @ 85**: Raw lengths: `85, 85, 45, 43` -> Target lengths: `85, 85, 45, 45`.
+### 2.3 Export UI
+- `File -> Export` is now a submenu that groups export actions instead of listing them flat in `File`.
+- Bookmark export is unified into a single dialog:
+  - `Image Sequence` mode for still exports.
+  - `Video` mode for stitched bookmark MP4 export.
+- Bookmark video export reuses the existing H.264 writer and repeats each bookmarked frame for a user-configurable hold duration at a user-configurable export FPS.
 
-### 2.3 Intelligent Grid Generation
-- **Grid Sizes**: Supports `2x2` (4 slots) and `3x3` (9 slots).
-- **Frame Selection**: Extracts `3` to `5` frames per chunk by default (First, Middle(s), Last).
-- **Waste Elimination**: The algorithm dynamically calculates "missing" frames to ensure no black squares appear in the grid. It injects extra middle frames into earlier chunks until the grid is perfectly filled.
-- **"One Grid Per Chunk" Mode**: A toggle that forces a 1:1 ratio. In this mode, exactly `cap` (4 or 9) frames are extracted per chunk so each chunk gets its own full grid image.
+### 2.4 Wan Preparation
+- The WAN preparation workflow remains the most mature export pipeline.
+- All chunks must follow `(x * 4) + 1`.
+- Requested chunk size snaps down to the nearest WAN-safe size.
+- Only the final chunk may be padded.
+- Overlap is optional and currently constrained to `4..32` frames.
+- Tail balancing avoids tiny final trailer chunks.
+- Grid generation supports:
+  - dynamic `2x2` / `3x3`
+  - waste elimination
+  - one-grid-per-chunk mode
 
-### 2.3 Metadata Export (JSON)
-- **Priority**: The JSON output is structured to put the most important info (`chunk 1`, `chunk 2`, etc.) at the top.
-- **Normalized Frames**: Frame indices for each chunk are **normalized to 0** (relative to the chunk start).
-- **Contents**: Includes absolute start/end frames, grid dimensions, and full chunking data.
+## 3. Gemma Shot Detection
 
-## 3. Architecture Map
+### 3.1 Goal
+- Detect **hard-cut** shot boundaries, not camera-motion changes inside one continuous take.
+- Avoid false positives from zooms, pans, tilts, dollies, reframing, rack focus, or subject movement.
 
-### Critical Files
-- [ui_main.py](ui_main.py): The "Hub". Contains the main window, all Dialog classes, and the heavy-lifting `prepare_wan` method.
-- [wan_chunks.py](wan_chunks.py): Pure mathematical logic for planning WAN-safe chunks.
-- [timeline.py](timeline.py): Manages the dual-timeline system.
-- [viewer.py](viewer.py): Handles rendering, Pan, and Zoom.
-- [project.py](project.py): State management for loaded media and bookmarks.
+### 3.2 High-Level Pipeline
+- Entry point: `File -> Detect Shots with Gemma...`
+- The selected range is split into **59-second chunks** to stay under the model’s practical video request limit.
+- Each chunk is encoded to a temporary MP4 and analyzed by **Gemma 4 only** (`gemma-4-31b-it` or `gemma-4-26b-a4b-it`).
+- A traditional dense cut scan runs locally across the selected frame range.
+- Gemma’s chunk-level shot guesses are aligned to the nearest traditional cut candidates.
+- Chunk seams are reconciled with Gemma image validation so split shots are not double-counted.
+- Strong unmatched traditional cut candidates are re-checked with Gemma image validation and can be promoted to final shot boundaries.
 
-## 4. Workflows & Rules for Agents
+### 3.3 Hard-Cut Rules
+- Internal Gemma shot guesses are no longer trusted on their own.
+- A Gemma-inferred internal shot boundary is kept only if it aligns closely with a traditional cut candidate.
+- Validation prompts explicitly tell Gemma:
+  - treat only real edits / hard cuts as boundaries
+  - do not split a shot because framing changes continuously inside the same take
 
-### 4.1 UI Conventions
-- Use `QFormLayout` for dialogs to maintain a clean, consistent look.
-- Use `QProgressBar` and `QApplication.processEvents()` during long exports.
-- Quality sliders map to **CRF**: 10 is near-lossless, 35 is highly compressed.
+### 3.4 Outputs
+- Writes:
+  - `*_gemma_shots.txt`
+  - `*_gemma_shots.json`
+- Can optionally add detected shots as bookmarks.
 
-### 4.2 Data Integrity
-- **Filenames**: Sanitize prefixes using `sanitize_filename_part`.
-- **JSON**: Dump metadata with `indent=4`. Use `asdict` for dataclasses.
-- **Coordinates**: Ensure overlays account for the viewer's transformation matrix.
+### 3.5 API / Reliability
+- Uses the Google GenAI SDK.
+- Startup loads `.env` from the repo root.
+- Blank API key field in the dialog falls back to:
+  - `GOOGLE_API_KEY`
+  - or `GEMINI_API_KEY`
+- A dummy placeholder key in `.env` is intentionally rejected with a clear warning.
+- Gemma upload, processing polling, and generation calls now retry automatically on transient Google `500 INTERNAL` errors with backoff.
 
-### 4.3 Adding New Features
-1. **Math First**: Update `wan_chunks.py` and `test_wan_chunks.py`.
-2. **Dialog Second**: Create a new `QDialog` class in `ui_main.py`.
-3. **Integration**: Add trigger method in `ViewerWidget`.
+## 4. Important Files
 
-## 5. Known Implementation Details
-- Uses **OpenCV** for reading, **imageio** for writing.
-- Bookmark video export reuses the existing H.264 writer and repeats each bookmarked frame for a user-configurable hold (in frames, default 1) at a user-configurable export FPS (default 24).
-- Memory monitoring via `psutil`.
-- Grid images are **95% quality JPEGs**.
+- [ui_main.py](ui_main.py): main window, dialogs, export flows, Gemma shot detection, bookmark controls.
+- [gemma_shot_detection.py](gemma_shot_detection.py): pure shot-detection helpers, chunk planning, candidate matching, seam merge logic, timestamp formatting.
+- [timeline.py](timeline.py): overview and thumbnail timelines, bookmark hover detection.
+- [wan_chunks.py](wan_chunks.py): WAN-safe chunk math.
+- [app_utils.py](app_utils.py): filename helpers, recent-file helpers, export naming utilities.
+- [main.py](main.py): app bootstrap and `.env` loading.
 
-## 6. Test Coverage
-Tests in [test_wan_chunks.py](test_wan_chunks.py) cover:
-- WAN ceil/floor snapping and normalization.
-- Short clip padding and final-chunk-only padding.
-- Balanced final two chunks and overlap-aware planning.
+## 5. Implementation Details
 
-**Representative cases**: `88 -> 85`, `100f @ 88`, `186f @ 93`, `258f @ 85` (with and without overlap).
+- Uses OpenCV for decoding / frame comparison and imageio for MP4 writing.
+- Shot detection contact sheets are rendered with Pillow and sent to Gemma as images for validation.
+- Project save/load supports both folder-based sources and direct video sources.
+- Bookmark video export and regular MP4 export share the same H.264 writer path.
+- Memory monitoring is displayed in the status bar via `psutil`.
+
+## 6. Tests
+
+- [test_wan_chunks.py](test_wan_chunks.py):
+  - WAN snapping
+  - overlap normalization
+  - short clip padding
+  - balanced final chunks
+- [test_app_utils.py](test_app_utils.py):
+  - export filename helpers
+  - recent file normalization
+- [test_gemma_shot_detection.py](test_gemma_shot_detection.py):
+  - 59-second chunk planning
+  - JSON response parsing
+  - cut candidate extraction
+  - candidate alignment
+  - seam-merge behavior
+  - final timestamp formatting

@@ -1,148 +1,111 @@
 # KFPlayer - Lightweight Animation Review Player
 
-## 1. Project Overview
+## 1. Overview
 
-**Project Name**: KFPlayer  
-**Type**: Desktop Application (Animation Review Tool)  
-**Core Feature**: A minimal, fast animation review player for animators. Load videos and image sequences, scrub with frame accuracy, set bookmarks, export compressed MP4 clips, export bookmarked frames as a stitched MP4 reel, and export WAN 2.2-friendly chunked MP4s.  
-**Target Users**: Animators and reviewers who need a lightweight, high-performance alternative to bloated media players.
+**KFPlayer** is a PyQt6 desktop review tool for animators and editors who need fast frame-accurate playback, timeline bookmarks, export tools, WAN-safe chunk preparation, and Gemma-powered hard-cut shot detection.
 
-## 2. UI/UX Specification
+It supports:
+- video files
+- image sequences
+- bookmark still export
+- bookmark video export
+- general MP4 export
+- WAN 2.2-style chunk export
+- Gemma 4 shot detection with timestamp output
 
-### 2.1 Window Layout
+## 2. Main Features
 
-The application uses a vertical `QSplitter` to allow user-adjustable scaling of the main work area and the timeline.
+### 2.1 Review Workflow
+- Load videos or image-sequence folders.
+- Scrub frame-accurately.
+- Use a dual-timeline layout:
+  - overview bar for global navigation
+  - thumbnail timeline for detailed scrubbing
+- Pan and zoom the viewer.
 
-```
-┌─────────────────────────────────────────────────────────┐
-│ Menu Bar (File, View, Playback, Help)                   │
-├─────────────────────────────────────────────────────────┤
-│ Tool Bar: [📂][|<][<][Play][>][>|] [Loop] [1x ▼] [Name] │
-├─────────────────────────────────────────────────────────┤
-│                                         │               │
-│                                         │  Bookmarks    │
-│            VIEWER (Top 90%)             │    Panel      │
-│     (Pan/Zoomable Video Display)        │               │
-│                                         │               │
-├─────────────────────────────────────────┴───────────────┤
-│ Overview Timeline (Nav Bar - Full Width Navigation)     │
-├─────────────────────────────────────────────────────────┤
-│ Timeline Playhead Handler (Vertical Splitter Separator) │
-├─────────────────────────────────────────────────────────┤
-│ Thumbnail Timeline (Bottom 10% - Scrollable)            │
-└─────────────────────────────────────────────────────────┘
-```
+### 2.2 Bookmarks
+- Add bookmarks at the current frame.
+- Remove bookmarks individually or clear all bookmarks.
+- Hovering a bookmark marker on the timeline changes the main bookmark button into a remove action for that hovered bookmark.
+- Bookmarks can be exported through one unified export dialog.
 
-### 2.2 Visual Design
+### 2.3 Export
+All export actions now live under `File -> Export`.
 
-**Color Palette**:
-- Background Dark: `#1A1A1A`
-- Panel Background: `#222222`
-- Accent Blue: `#00A8FF`
-- Text Primary: `#E0E0E0`
-- Timeline Playhead: `#00FF88` (Green)
-- Bookmarks: `#FF6B35` (Orange)
+Available export paths:
+- frame / sequence export
+- current / first / last frame image export
+- bookmark export
+- MP4 export
+- WAN preparation export
 
-**UI Enhancements**:
-- **Modern Styling**: Rounded corners (4px radius) on buttons, inputs, and panels.
-- **Glassmorphism Influences**: Subtle hover states and border highlights.
-- **Tooltips**: Descriptive tooltips on all toolbar buttons including keyboard shortcuts.
-- **Styled Scrollbars**: Thin, rounded, dark scrollbars for a premium feel.
+Bookmark export is unified:
+- `Image Sequence` mode exports bookmark stills.
+- `Video` mode exports a stitched MP4 reel with configurable hold duration, FPS, quality, and speed preset.
 
-### 2.3 Components
+### 2.4 WAN Preparation
+WAN preparation is designed for long clips that need WAN-safe chunk sizes.
 
-**Viewer**:
-- Pan: Left-Click + Drag (Fixed and fully functional)
-- Zoom: Scroll Wheel
-- Fit to Window: `F` key
+Key rules:
+- valid chunk lengths follow `(x * 4) + 1`
+- requested sizes snap down to the nearest valid size
+- only the final chunk may be padded
+- overlap is optional
+- short trailing chunks are rebalanced to avoid tiny tails
 
-**Overview Timeline**:
-- **Global Navigation**: A thin bar representing the entire clip length.
-- **Instant Seek**: Click or drag to jump to any percentage of the video instantly.
-- **Bookmark Markers**: Visual indicators of all bookmarks across the full duration.
+It can also generate contact-sheet grids and JSON metadata for selected chunk frames.
 
-**Thumbnail Timeline**:
-- **Dynamic Thumbnails**: Thumbnails scale vertically to fill the entire height of the timeline panel.
-- **Auto-Scrolling**: The timeline automatically follows the playhead during playback and scrubbing.
+### 2.5 Gemma Shot Detection
+The app includes a `Detect Shots with Gemma...` dialog for hard-cut detection.
 
-**Bookmarks Panel**:
-- Jump: Click any bookmark in the list to jump to that frame.
-- **Delete**: Right-click a bookmark in the list to remove it.
+Pipeline summary:
+- split the selected range into **59-second chunks**
+- analyze each chunk with **Gemma 4 only**
+- run a traditional frame-difference cut scan locally
+- snap Gemma’s internal boundaries to traditional cut candidates
+- validate chunk seams and strong unmatched candidates with Gemma image checks
+- output:
+  - `*_gemma_shots.txt`
+  - `*_gemma_shots.json`
 
-## 3. Functional Specification
+The prompts are tuned for **true edit boundaries**, not framing changes within one take. Zooms, pans, tilts, dollies, reframing, focus changes, and subject movement should not create a new shot by themselves.
 
-### 3.1 Core Features
+## 3. API Key Setup
 
-**Source Loading**:
-- **Drag and Drop**: Drag folders, videos, or images directly onto the app.
-- **Dynamic Title**: Window title and toolbar label update to show the loaded file/folder name.
+Gemma detection uses the Google GenAI SDK.
 
-**Export**:
-- **MP4 Export**: H.264 export with integrated Quality and Speed control.
-- **Compression**: User-selectable Quality (1-10) mapping to FFMPEG CRF.
-- **Performance**: Speed Presets (**ultrafast**, **fast**, **medium**, **slow**) to optimize encoding time.
-- **Bookmark Reel Export**: Export all bookmarks as a stitched MP4 in timeline order, with a configurable hold duration per bookmark.
-- **WAN 2.2 Chunk Export**: Export long videos as multiple MP4 chunks tailored to WAN-safe frame counts.
-- **Chunk Controls**: User-selectable chunk size with WAN-safe snapping and optional chunk overlap.
-- **Tail Handling**: Rebalance the last two chunks to avoid extremely short trailer clips, and only pad the final chunk when required.
+The app loads a local `.env` file at startup and uses either:
+- `GOOGLE_API_KEY`
+- `GEMINI_API_KEY`
 
-## 4. Technical Implementation
+If the Detect Shots dialog API field is left blank, KFPlayer falls back to those environment values automatically.
 
-**Core Technologies**:
-- **Framework**: PyQt6
-- **Video Decoding**: OpenCV (cv2) for frame-accurate playback and thumbnail extraction.
-- **Video Encoding**: `imageio` with `imageio-ffmpeg` plugin for high-performance H.264 export with custom presets.
-- **Image Processing**: Pillow (PIL) and NumPy for matrix manipulation and format conversion.
-- **System Monitoring**: `psutil` for real-time memory tracking in the status bar.
+The repo includes a dummy `.env` placeholder. Replace it with your real Google AI Studio key before using Gemma detection.
 
-**Architecture**:
-- **Main Window**: `MainWindow` (ui_main.py) - Central coordinator.
-- **Viewer**: `ViewerWidget` (viewer.py) - Custom widget for hardware-accelerated QPixmap rendering with Pan/Zoom support.
-- **Overview Timeline**: `OverviewTimelineWidget` (timeline.py) - Thin global navigation control.
-- **Thumbnail Timeline**: `TimelineWidget` (timeline.py) - Scrollable detail scrub bar.
-- **Project Data**: `Project` (project.py) - JSON-backed state management.
-- **WAN Chunk Planner**: `wan_chunks.py` - Pure planning logic for WAN-safe chunk sizing, overlap normalization, and final-tail balancing.
+## 4. Reliability Notes
 
-### 4.2 Encoding Parameters
-- **Codec**: `libx264` (H.264) via FFMPEG backend.
-- **Compression**: User-selectable CRF (Constant Rate Factor) ranging from 15 (High Quality) to 35 (Small Size).
-- **Speed Presets**: FFMPEG presets (**ultrafast**, **fast**, **medium**, **slow**) to balance encoding time and file efficiency.
-- **Bookmark Video Behavior**: Bookmark reels reuse the same H.264 pipeline, repeating each bookmarked frame for the configured hold duration.
+- Gemma upload, file-processing polling, and generation calls retry automatically on transient Google `500 INTERNAL` server errors.
+- If Gemma is unavailable after retries, the app shows a clearer failure message instead of a raw exception.
 
-### 4.3 WAN Export Rules
-- **WAN-Safe Frame Counts**: Valid WAN lengths follow the pattern `(x * 4) + 1`.
-- **Chunk Size Snapping**: User-entered chunk sizes are snapped down to the nearest WAN-safe value.
-- **Example**: `88` snaps to `85`.
-- **Short Clips**: If a clip is shorter than one chunk, export a single chunk and pad only the final frame count up to the next WAN-safe length.
-- **Final Two Chunks**: If the remaining span fits inside a two-chunk window, rebalance those last two chunks instead of leaving a tiny final trailer.
-- **Padding Rule**: Only the final chunk may be padded, using repetition of the last frame within the user's selected range. Padding never reads frames beyond the selected end frame.
-- **Overlap**: Optional overlap is supported between chunks. Overlap is applied by moving the next chunk backward so it shares frames with the end of the previous chunk.
-- **Overlap Range**: Current supported overlap range is `4` to `32` frames.
+## 5. Tech Stack
 
-### 4.4 Current WAN Export UI
-- **Entry Point**: File menu action for WAN 2.2 chunk export.
-- **Controls**:
-  - output folder
-  - filename prefix
-  - chunk size input
-  - overlap toggle and overlap amount
-  - quality slider
-  - speed preset
-- **Preview**: The dialog previews planned WAN-safe chunk lengths, raw source chunk lengths, overlap state, and whether final padding is required.
+- Python 3.x
+- PyQt6
+- OpenCV
+- imageio / imageio-ffmpeg
+- Pillow
+- numpy
+- psutil
+- google-genai
 
-## 5. Acceptance Criteria
+## 6. Key Files
 
-1. ✅ **Dynamic UI**: Timeline at the bottom, adjustable via splitter, with vertically scaling thumbnails.
-2. ✅ **Navigation**: Both detailed (thumbnail) and global (overview) timelines synced.
-3. ✅ **Performance**: Export speed control (ultrafast) significantly reduces wait times.
-4. ✅ **Compatibility**: MP4 exports are small and highly compatible across OS and node-based software.
-5. ✅ **UX**: Drag-and-drop support for all media types, tooltips on all buttons, and dynamic window titles.
-6. ✅ **Stability**: No more memory-padding crashes during export (reshape handling fixed).
-7. ✅ **Quality**: Viewer pan and zoom work flawlessly and preserve aspect ratio.
-8. ✅ **WAN Export**: Long videos can be exported as WAN-safe MP4 chunks with controllable chunk size.
-9. ✅ **Tail Quality**: WAN chunking avoids unusably short tail clips by rebalancing the final two chunks.
-10. ✅ **Padding Integrity**: Only the final WAN chunk is padded, preserving continuity in intermediate chunks.
-11. ✅ **Overlap Control**: WAN export supports optional overlap between chunks with preview feedback.
+- [main.py](main.py): app bootstrap and `.env` loading
+- [ui_main.py](ui_main.py): UI, dialogs, exports, Gemma shot detection
+- [timeline.py](timeline.py): overview and thumbnail timeline widgets
+- [gemma_shot_detection.py](gemma_shot_detection.py): pure shot-detection logic
+- [wan_chunks.py](wan_chunks.py): WAN-safe chunk planning logic
 
-## 6. Deployment
-- **Executable**: `run_kfplayer.bat` provides a convenient launcher for Windows environments, activating the virtual environment and running the player without a persistent console window.
+## 7. Running
+
+Use [run_kfplayer.bat](run_kfplayer.bat) on Windows, or run `main.py` from the project environment.

@@ -375,7 +375,7 @@ class MainWindow(QMainWindow):
         wan_prep_action.triggered.connect(self.show_wan_preparation_dialog)
         export_menu.addAction(wan_prep_action)
 
-        gemma_shot_action = QAction("Detect Shots with Gemma...", self)
+        gemma_shot_action = QAction("Detect Shots...", self)
         gemma_shot_action.setShortcut(QKeySequence("Ctrl+Shift+G"))
         gemma_shot_action.triggered.connect(self.show_gemma_shot_detection_dialog)
         file_menu.addAction(gemma_shot_action)
@@ -2993,6 +2993,36 @@ Rules:
             for i in range(missing):
                 k_list[i % num_chunks] += 1
 
+        # --- Phase 1: compute initial frame selections for review ---
+        review_data = []
+        for chunk_index, chunk in enumerate(chunk_plan):
+            abs_start = start_frame + chunk.start_frame
+            abs_end_raw = start_frame + chunk.end_frame
+            abs_end = min(abs_end_raw, end_frame)
+
+            k_i = k_list[chunk_index]
+            span = abs_end - abs_start
+            if span == 0:
+                indices = [abs_start] * k_i
+            else:
+                indices = [abs_start + i * span // (k_i - 1) for i in range(k_i)]
+
+            review_data.append({
+                "chunk_index": chunk_index,
+                "abs_start": abs_start,
+                "abs_end": abs_end,
+                "selected_frames": list(indices),
+            })
+
+        # --- Phase 2: show review dialog ---
+        review = WanFrameReviewDialog(self, review_data, self.load_frame_data)
+        if review.exec() != QDialog.DialogCode.Accepted:
+            return
+
+        # Collect the (possibly modified) frame selections
+        reviewed_data = review.get_all_selected_frames()
+
+        # --- Phase 3: export MP4s and grids using reviewed selections ---
         total_mp4_frames = sum(chunk.target_length for chunk in chunk_plan)
 
         progress = QDialog(self)
@@ -3057,15 +3087,11 @@ Rules:
 
                 completed_frames += len(frame_numbers)
 
-                k_i = k_list[chunk_index - 1]
-                span = abs_end - abs_start
-                if span == 0:
-                    indices = [abs_start] * k_i
-                else:
-                    indices = [abs_start + i * span // (k_i - 1) for i in range(k_i)]
-                
+                # Use the reviewed frame selections instead of recomputing
+                reviewed_indices = reviewed_data[chunk_index - 1]["selected_frames"]
+
                 chunk_images = []
-                for idx in indices:
+                for idx in reviewed_indices:
                     pixmap = self.load_frame_data(idx)
                     if pixmap:
                         img_rgb = self.pixmap_to_rgb_array(pixmap)
@@ -3079,7 +3105,7 @@ Rules:
                     "chunk_data": asdict(chunk),
                     "video_start_frame_abs": abs_start,
                     "video_end_frame_abs": abs_end,
-                    "selected_frames_abs": indices
+                    "selected_frames_abs": reviewed_indices
                 })
 
             bar.setValue(total_mp4_frames)
@@ -3767,7 +3793,7 @@ class GemmaShotDetectionDialog(QDialog):
     def __init__(self, parent):
         super().__init__(parent)
         self.parent_window = parent
-        self.setWindowTitle("Detect Shots with Gemma")
+        self.setWindowTitle("Detect Shots")
         self.setModal(True)
         self.setMinimumWidth(460)
 
@@ -3797,7 +3823,7 @@ class GemmaShotDetectionDialog(QDialog):
             "Optional here if GOOGLE_API_KEY or GEMINI_API_KEY is set in .env"
         )
         api_hint = QLabel(
-            "Gemma only. The key is used for this run; leaving it blank uses GOOGLE_API_KEY or GEMINI_API_KEY from .env."
+            "Uses the selected Google model for this run; leaving the field blank uses GOOGLE_API_KEY or GEMINI_API_KEY from .env."
         )
         api_hint.setWordWrap(True)
         api_hint.setStyleSheet("color: gray; font-size: 10px;")
@@ -3807,9 +3833,13 @@ class GemmaShotDetectionDialog(QDialog):
         layout.addRow("Google API Key:", api_layout)
 
         self.model_combo = QComboBox()
+        self.model_combo.addItem("Gemini 3 Flash", "gemini-3-flash-preview")
+        self.model_combo.addItem("Gemini 3.1 Flash-Lite", "gemini-3.1-flash-lite-preview")
         self.model_combo.addItem("Gemma 4 31B Instruct", "gemma-4-31b-it")
         self.model_combo.addItem("Gemma 4 26B A4B Instruct", "gemma-4-26b-a4b-it")
-        model_hint = QLabel("Video understanding stays on Gemma only. No Gemini model fallback is used.")
+        model_hint = QLabel(
+            "Supported local options include Gemini 3 Flash, Gemini 3.1 Flash-Lite, and Gemma 4 models."
+        )
         model_hint.setWordWrap(True)
         model_hint.setStyleSheet("color: gray; font-size: 10px;")
         model_layout = QVBoxLayout()
@@ -3882,6 +3912,292 @@ class GemmaShotDetectionDialog(QDialog):
             f"{total_frames} frame(s) / {seconds:.2f} second(s) will be analyzed as "
             f"{len(chunks)} Gemma chunk(s) of up to {SHOT_ANALYSIS_CHUNK_SECONDS:.0f} seconds each."
         )
+
+
+class WanFramePickerDialog(QDialog):
+    """Shows frames around a chunk range so the user can pick a replacement frame."""
+
+    def __init__(self, parent, chunk_start, chunk_end, current_frame, load_frame_fn):
+        super().__init__(parent)
+        self.setWindowTitle("Pick a Frame")
+        self.setModal(True)
+        self.picked_frame = current_frame
+        self.load_frame_fn = load_frame_fn
+        self.chunk_start = chunk_start
+        self.chunk_end = chunk_end
+
+        self.setMinimumSize(700, 480)
+
+        layout = QVBoxLayout(self)
+        layout.setSpacing(8)
+
+        header = QLabel(
+            f"Scrub to choose a replacement frame (chunk range: {chunk_start}–{chunk_end})"
+        )
+        header.setStyleSheet("font-weight: bold; font-size: 13px;")
+        layout.addWidget(header)
+
+        # Large preview
+        self.preview_label = QLabel()
+        self.preview_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.preview_label.setMinimumHeight(300)
+        self.preview_label.setSizePolicy(
+            QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding
+        )
+        self.preview_label.setStyleSheet(
+            "background: #1a1a2e; border: 1px solid #333; border-radius: 4px;"
+        )
+        layout.addWidget(self.preview_label)
+
+        # Slider for frame scrubbing
+        slider_layout = QHBoxLayout()
+        self.frame_slider = QSlider(Qt.Orientation.Horizontal)
+        self.frame_slider.setRange(chunk_start, chunk_end)
+        self.frame_slider.setValue(current_frame)
+        self.frame_slider.valueChanged.connect(self._on_slider_changed)
+        slider_layout.addWidget(self.frame_slider)
+
+        self.frame_num_label = QLabel(f"Frame {current_frame}")
+        self.frame_num_label.setFixedWidth(90)
+        self.frame_num_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        slider_layout.addWidget(self.frame_num_label)
+        layout.addLayout(slider_layout)
+
+        # Buttons
+        btn_layout = QHBoxLayout()
+        btn_layout.addStretch()
+        pick_btn = QPushButton("Use This Frame")
+        pick_btn.setDefault(True)
+        pick_btn.setStyleSheet(
+            "QPushButton { background: #4a6cf7; color: white; padding: 8px 24px; "
+            "border-radius: 4px; font-weight: bold; }"
+            "QPushButton:hover { background: #3b5de7; }"
+        )
+        pick_btn.clicked.connect(self.accept)
+        cancel_btn = QPushButton("Cancel")
+        cancel_btn.setStyleSheet("padding: 8px 16px;")
+        cancel_btn.clicked.connect(self.reject)
+        btn_layout.addWidget(cancel_btn)
+        btn_layout.addWidget(pick_btn)
+        layout.addLayout(btn_layout)
+
+        self._update_preview(current_frame)
+
+    def _on_slider_changed(self, value):
+        self.picked_frame = value
+        self.frame_num_label.setText(f"Frame {value}")
+        self._update_preview(value)
+
+    def _update_preview(self, frame_num):
+        pixmap = self.load_frame_fn(frame_num)
+        if pixmap:
+            scaled = pixmap.scaled(
+                self.preview_label.size(),
+                Qt.AspectRatioMode.KeepAspectRatio,
+                Qt.TransformationMode.SmoothTransformation,
+            )
+            self.preview_label.setPixmap(scaled)
+        else:
+            self.preview_label.setText("Could not load frame")
+
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        self._update_preview(self.picked_frame)
+
+
+class _ClickableThumbnail(QLabel):
+    """A thumbnail label that emits a click signal with its index."""
+    clicked = pyqtSignal(int)
+
+    def __init__(self, index, parent=None):
+        super().__init__(parent)
+        self._index = index
+        self.setCursor(QCursor(Qt.CursorShape.PointingHandCursor))
+
+    def mousePressEvent(self, event):
+        self.clicked.emit(self._index)
+        super().mousePressEvent(event)
+
+
+class WanFrameReviewDialog(QDialog):
+    """Shows all selected grid frames for review before export.
+
+    The user can accept the selection or click any thumbnail to replace it
+    by picking from the chunk's frame range.
+    """
+
+    THUMB_SIZE = 160
+
+    def __init__(self, parent, selection_data, load_frame_fn):
+        """
+        Args:
+            parent: parent widget (the main window).
+            selection_data: list of dicts, one per chunk:
+                {
+                    "chunk_index": int,
+                    "abs_start": int,
+                    "abs_end": int,
+                    "selected_frames": [int, ...],
+                }
+            load_frame_fn: callable(frame_num) -> QPixmap or None.
+        """
+        super().__init__(parent)
+        self.setWindowTitle("Review Grid Frame Selections")
+        self.setModal(True)
+        self.load_frame_fn = load_frame_fn
+        self.selection_data = selection_data
+        self._thumbnails = []  # list of (thumbnail_widget, flat_index, chunk_idx, frame_idx_in_chunk)
+
+        self.setMinimumSize(660, 420)
+
+        outer = QVBoxLayout(self)
+        outer.setSpacing(10)
+
+        header = QLabel(
+            "Review the frames selected for each chunk's grid slots.\n"
+            "Click any thumbnail to replace it with a different frame from that chunk."
+        )
+        header.setWordWrap(True)
+        header.setStyleSheet("font-size: 13px; padding: 4px 0;")
+        outer.addWidget(header)
+
+        # Scrollable area for all thumbnails
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setStyleSheet(
+            "QScrollArea { border: none; }"
+        )
+        scroll_widget = QWidget()
+        self.thumbs_layout = QVBoxLayout(scroll_widget)
+        self.thumbs_layout.setSpacing(12)
+        scroll.setWidget(scroll_widget)
+        outer.addWidget(scroll, stretch=1)
+
+        # Buttons
+        btn_layout = QHBoxLayout()
+        btn_layout.addStretch()
+        accept_btn = QPushButton("Accept && Export")
+        accept_btn.setDefault(True)
+        accept_btn.setStyleSheet(
+            "QPushButton { background: #2ecc71; color: white; padding: 10px 28px; "
+            "border-radius: 5px; font-weight: bold; font-size: 13px; }"
+            "QPushButton:hover { background: #27ae60; }"
+        )
+        accept_btn.clicked.connect(self.accept)
+        cancel_btn = QPushButton("Cancel")
+        cancel_btn.setStyleSheet("padding: 10px 18px; font-size: 13px;")
+        cancel_btn.clicked.connect(self.reject)
+        btn_layout.addWidget(cancel_btn)
+        btn_layout.addWidget(accept_btn)
+        outer.addLayout(btn_layout)
+
+        self._build_thumbnails()
+
+    def _build_thumbnails(self):
+        """Create thumbnail widgets for every selected frame, grouped by chunk."""
+        # Clear previous widgets
+        while self.thumbs_layout.count():
+            item = self.thumbs_layout.takeAt(0)
+            w = item.widget()
+            if w:
+                w.deleteLater()
+            sub = item.layout()
+            if sub:
+                while sub.count():
+                    child = sub.takeAt(0)
+                    cw = child.widget()
+                    if cw:
+                        cw.deleteLater()
+
+        self._thumbnails.clear()
+        flat_index = 0
+
+        for chunk_data in self.selection_data:
+            chunk_idx = chunk_data["chunk_index"]
+            abs_start = chunk_data["abs_start"]
+            abs_end = chunk_data["abs_end"]
+            frames = chunk_data["selected_frames"]
+
+            # Chunk header
+            chunk_header = QLabel(
+                f"Chunk {chunk_idx + 1}  "
+                f"<span style='color: #888; font-size: 11px;'>"
+                f"(frames {abs_start}–{abs_end})</span>"
+            )
+            chunk_header.setStyleSheet(
+                "font-weight: bold; font-size: 12px; padding: 2px 0 0 0;"
+            )
+            self.thumbs_layout.addWidget(chunk_header)
+
+            row_layout = QHBoxLayout()
+            row_layout.setSpacing(6)
+            for fi, frame_num in enumerate(frames):
+                thumb = _ClickableThumbnail(flat_index)
+                thumb.setFixedSize(self.THUMB_SIZE, self.THUMB_SIZE)
+                thumb.setAlignment(Qt.AlignmentFlag.AlignCenter)
+                thumb.setStyleSheet(
+                    "QLabel { background: #1a1a2e; border: 2px solid #333; "
+                    "border-radius: 4px; }"
+                    "QLabel:hover { border-color: #4a6cf7; }"
+                )
+                thumb.setToolTip(
+                    f"Frame {frame_num}  (click to replace)"
+                )
+                thumb.clicked.connect(self._on_thumb_clicked)
+
+                self._set_thumbnail_pixmap(thumb, frame_num)
+                row_layout.addWidget(thumb)
+                self._thumbnails.append((thumb, flat_index, chunk_idx, fi))
+                flat_index += 1
+
+            row_layout.addStretch()
+            self.thumbs_layout.addLayout(row_layout)
+
+        self.thumbs_layout.addStretch()
+
+    def _set_thumbnail_pixmap(self, label, frame_num):
+        """Load a frame and set it as a scaled pixmap on the label."""
+        pixmap = self.load_frame_fn(frame_num)
+        if pixmap:
+            scaled = pixmap.scaled(
+                self.THUMB_SIZE - 4, self.THUMB_SIZE - 4,
+                Qt.AspectRatioMode.KeepAspectRatio,
+                Qt.TransformationMode.SmoothTransformation,
+            )
+            label.setPixmap(scaled)
+        else:
+            label.setText(f"F{frame_num}")
+
+    def _on_thumb_clicked(self, flat_index):
+        """Open the frame picker for the chunk owning this thumbnail."""
+        entry = None
+        for t_widget, t_flat, t_chunk, t_fi in self._thumbnails:
+            if t_flat == flat_index:
+                entry = (t_widget, t_flat, t_chunk, t_fi)
+                break
+        if entry is None:
+            return
+
+        widget, _, chunk_idx, fi = entry
+        chunk_data = self.selection_data[chunk_idx]
+        current_frame = chunk_data["selected_frames"][fi]
+
+        picker = WanFramePickerDialog(
+            self,
+            chunk_data["abs_start"],
+            chunk_data["abs_end"],
+            current_frame,
+            self.load_frame_fn,
+        )
+        if picker.exec() == QDialog.DialogCode.Accepted:
+            new_frame = picker.picked_frame
+            chunk_data["selected_frames"][fi] = new_frame
+            self._set_thumbnail_pixmap(widget, new_frame)
+            widget.setToolTip(f"Frame {new_frame}  (click to replace)")
+
+    def get_all_selected_frames(self):
+        """Return the (possibly modified) selection data."""
+        return self.selection_data
 
 
 class WanPreparationDialog(QDialog):

@@ -43,6 +43,7 @@ This document is the definitive technical summary of the project's current imple
   - dynamic `2x2` / `3x3`
   - waste elimination
   - one-grid-per-chunk mode
+- **Frame Review**: After chunking, a `WanFrameReviewDialog` shows all auto-selected grid frames grouped by chunk. The user can accept or click any thumbnail to open a `WanFramePickerDialog` slider to pick a replacement frame from that chunk's range. Export only proceeds after explicit approval.
 
 ## 3. Gemma Shot Detection
 

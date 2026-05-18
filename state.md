@@ -45,6 +45,17 @@ This document is the definitive technical summary of the project's current imple
   - one-grid-per-chunk mode
 - **Frame Review**: After chunking, a `WanFrameReviewDialog` shows all auto-selected grid frames grouped by chunk. The user can accept or click any thumbnail to open a `WanFramePickerDialog` slider to pick a replacement frame from that chunk's range. Export only proceeds after explicit approval.
 
+### 2.5 Smart Grid Splitter
+- Accessed via `File -> Export -> Smart Grid Splitter...`.
+- Takes a video chunk, JSON metadata, and a colorized grid image as input.
+- A setup dialog lets the user pick the chunk to work with.
+- The splitter viewport loads the video but restricts navigation to only the frames used to build the grid (from the JSON metadata).
+- The grid image is overlaid on the video frame and auto-positioned using cell-based offset calculation (`col = i % dim`, `row = i // dim`, offset by `-col * frame_w`, `-row * frame_h`).
+- Controls: opacity slider, scale slider, aspect-ratio lock toggle.
+- The grid position can be manually adjusted by click-dragging. Manual nudge persists across forward/backward navigation.
+- Export crops each grid cell and saves it as a separate image aligned to the original video resolution.
+- Implementation lives in [grid_splitter.py](grid_splitter.py).
+
 ## 3. Gemma Shot Detection
 
 ### 3.1 Goal
@@ -89,6 +100,7 @@ This document is the definitive technical summary of the project's current imple
 - [timeline.py](timeline.py): overview and thumbnail timelines, bookmark hover detection.
 - [wan_chunks.py](wan_chunks.py): WAN-safe chunk math.
 - [app_utils.py](app_utils.py): filename helpers, recent-file helpers, export naming utilities.
+- [grid_splitter.py](grid_splitter.py): Smart Grid Splitter dialog, viewport compositing, cell-based position calculation, and split export.
 - [main.py](main.py): app bootstrap and `.env` loading.
 
 ## 5. Implementation Details

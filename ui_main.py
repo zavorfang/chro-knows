@@ -64,6 +64,7 @@ from wan_chunks import (
     normalize_wan_chunk_size,
     plan_wan_chunks,
 )
+from grid_splitter import GridSplitterSetupDialog, SmartGridSplitterDialog
 from app_utils import (
     IMAGE_EXPORT_FILTER,
     IMAGE_EXPORT_FORMATS,
@@ -374,6 +375,10 @@ class MainWindow(QMainWindow):
         wan_prep_action = QAction("Wan Preparation...", self)
         wan_prep_action.triggered.connect(self.show_wan_preparation_dialog)
         export_menu.addAction(wan_prep_action)
+
+        grid_splitter_action = QAction("Smart Grid Splitter...", self)
+        grid_splitter_action.triggered.connect(self.show_grid_splitter_dialog)
+        export_menu.addAction(grid_splitter_action)
 
         gemma_shot_action = QAction("Detect Shots...", self)
         gemma_shot_action.setShortcut(QKeySequence("Ctrl+Shift+G"))
@@ -1861,6 +1866,20 @@ class MainWindow(QMainWindow):
                 output_folder, prefix, chunk_size, overlap, quality, preset,
                 start_frame, end_frame, grid_size, per_chunk_grid
             )
+
+    def show_grid_splitter_dialog(self):
+        default_folder = ""
+        if self.export_folder:
+            default_folder = self.export_folder
+        elif getattr(self.project, "is_video", False) and hasattr(self.project, "video_path"):
+            default_folder = os.path.dirname(self.project.video_path)
+
+        setup = GridSplitterSetupDialog(self, default_folder=default_folder)
+        if setup.exec() != QDialog.DialogCode.Accepted:
+            return
+        data = setup.result_data()
+        splitter = SmartGridSplitterDialog(self, data)
+        splitter.exec()
 
     def show_gemma_shot_detection_dialog(self):
         if self.total_frames == 0:

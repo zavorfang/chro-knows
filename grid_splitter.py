@@ -423,6 +423,15 @@ class SmartGridSplitterDialog(QDialog):
         self._grid_dim = self._json_data.get("grid_dim", 2)
         self._frame_w, self._frame_h = _video_dimensions(self._video_path)
 
+        # Calculate offset in the grid if multiple chunks share a grid
+        chunks = self._json_data.get("chunks", [])
+        current_global_index = 0
+        for i in range(min(self._chunk_index, len(chunks))):
+            current_global_index += len(chunks[i].get("selected_frames_abs", []))
+
+        grid_cap = self._grid_dim * self._grid_dim
+        self._grid_cell_offset = current_global_index % grid_cap
+
         # Find the selected frames for this chunk (relative to chunk start)
         self._chunk_frames_relative = []
         self._chunk_abs_start = 0
@@ -589,8 +598,9 @@ class SmartGridSplitterDialog(QDialog):
         self._viewport.set_frame(pixmap)
 
         # Compute algorithmic grid offset for this cell
-        col = index % self._grid_dim
-        row = index // self._grid_dim
+        grid_index = index + self._grid_cell_offset
+        col = grid_index % self._grid_dim
+        row = grid_index // self._grid_dim
         base_x = -col * self._frame_w
         base_y = -row * self._frame_h
         self._viewport.set_base_offset(base_x, base_y)
@@ -689,8 +699,9 @@ class SmartGridSplitterDialog(QDialog):
 
         try:
             for i in range(n):
-                col = i % dim
-                row = i // dim
+                grid_index = i + self._grid_cell_offset
+                col = grid_index % dim
+                row = grid_index // dim
                 nudge_i = self._nudges.get(i, QPointF(0, 0))
 
                 cell_gw = grid_w / dim

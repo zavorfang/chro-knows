@@ -112,8 +112,8 @@ class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
         self.setWindowTitle("Keyframe Pro Lite")
-        self.setGeometry(100, 100, 1400, 900)
-        self.setMinimumSize(1000, 700)
+        self.setGeometry(100, 100, 1280, 720)
+        self.setMinimumSize(640, 480)
 
         self.project = Project()
         self.current_frame = 0
@@ -488,6 +488,14 @@ class MainWindow(QMainWindow):
     def get_default_export_folder(self):
         if self.export_folder and os.path.isdir(self.export_folder):
             return self.export_folder
+
+        default_base = os.path.join(os.path.expanduser("~"), "Videos", "KFPlayer")
+        try:
+            os.makedirs(default_base, exist_ok=True)
+            return default_base
+        except:
+            pass
+
         if getattr(self.project, "is_video", False) and hasattr(self.project, "video_path"):
             return os.path.dirname(self.project.video_path)
         if self.project.folder and os.path.isdir(self.project.folder):
@@ -647,9 +655,17 @@ class MainWindow(QMainWindow):
             if hasattr(self.project, "video_path"):
                 delattr(self.project, "video_path")
 
-            self.project.add_source(folder, sequences[0])
             self.total_frames = len(sequences[0]["files"])
             self.current_frame = 0
+
+            # Get resolution from first frame
+            try:
+                from PIL import Image
+                with Image.open(sequences[0]["files"][0]) as img:
+                    self.video_width, self.video_height = img.size
+            except:
+                self.video_width, self.video_height = 0, 0
+
             self.update_frame_display()
             self.timeline.set_total_frames(self.total_frames)
             self.overview_timeline.set_total_frames(self.total_frames)
@@ -784,6 +800,9 @@ class MainWindow(QMainWindow):
 
         # Clear frame cache
         self.frame_cache = {}
+
+        self.video_width = width
+        self.video_height = height
 
         # Update UI
         self.update_frame_display()
@@ -1085,8 +1104,12 @@ class MainWindow(QMainWindow):
             self.play_timer.start(interval)
 
     def update_frame_display(self):
+        res_str = ""
+        if hasattr(self, "video_width") and hasattr(self, "video_height") and self.video_width > 0:
+            res_str = f" [{self.video_width}x{self.video_height}]"
+
         self.frame_label.setText(
-            f"Frame: {self.current_frame + 1} / {self.total_frames}"
+            f"Frame: {self.current_frame + 1} / {self.total_frames}{res_str}"
         )
 
         total_seconds = self.current_frame / self.fps
@@ -1868,11 +1891,7 @@ class MainWindow(QMainWindow):
             )
 
     def show_grid_splitter_dialog(self):
-        default_folder = ""
-        if self.export_folder:
-            default_folder = self.export_folder
-        elif getattr(self.project, "is_video", False) and hasattr(self.project, "video_path"):
-            default_folder = os.path.dirname(self.project.video_path)
+        default_folder = self.get_default_export_folder()
 
         setup = GridSplitterSetupDialog(self, default_folder=default_folder)
         if setup.exec() != QDialog.DialogCode.Accepted:
@@ -3269,7 +3288,7 @@ class PreferencesDialog(QDialog):
         self.fps.setValue(parent.fps)
         layout.addRow("Default FPS:", self.fps)
 
-        self.export_folder = QLineEdit(parent.export_folder)
+        self.export_folder = QLineEdit(parent.export_folder or parent.get_default_export_folder())
         folder_layout = QHBoxLayout()
         folder_layout.addWidget(self.export_folder)
         browse_btn = QPushButton("...")
@@ -4232,13 +4251,7 @@ class WanPreparationDialog(QDialog):
         self.plan_info.setWordWrap(True)
         layout.addRow(self.plan_info)
 
-        if parent.export_folder:
-            default_output_folder = parent.export_folder
-        elif getattr(parent.project, "is_video", False) and hasattr(parent.project, "video_path"):
-            default_output_folder = os.path.dirname(parent.project.video_path)
-        else:
-            default_output_folder = parent.project.folder
-
+        default_output_folder = parent.get_default_export_folder()
         self.output_folder = QLineEdit(default_output_folder)
         folder_layout = QHBoxLayout()
         folder_layout.addWidget(self.output_folder)

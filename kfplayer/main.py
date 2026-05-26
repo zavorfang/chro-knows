@@ -21,7 +21,7 @@ class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
         self.setWindowTitle("KFPlayer - Animation Review")
-        self.setMinimumSize(1024, 600)
+        self.setMinimumSize(640, 480)
         
         self.project: Project = Project()
         self.engine = PlayerEngine()

@@ -3092,12 +3092,17 @@ Rules:
                 # Clamp to user's selected range so we never read past the shot
                 abs_end = min(abs_end_raw, end_frame)
                 
+                # Create dedicated chunk subdirectory
+                chunk_dir_name = f"{prefix}_chunk_{chunk_index:03d}"
+                chunk_dir = os.path.join(output_folder, chunk_dir_name)
+                os.makedirs(chunk_dir, exist_ok=True)
+
                 filename = (
                     f"{prefix}_wan22_{chunk_index:03d}_"
                     f"{chunk.target_length:03d}f_"
                     f"{abs_start:04d}-{abs_end:04d}.mp4"
                 )
-                filepath = os.path.join(output_folder, filename)
+                filepath = os.path.join(chunk_dir, filename)
 
                 frame_numbers = list(range(abs_start, abs_end + 1))
                 # Pad with the last valid frame to reach WAN-safe target length
@@ -3129,14 +3134,38 @@ Rules:
                 reviewed_indices = reviewed_data[chunk_index - 1]["selected_frames"]
 
                 chunk_images = []
-                for idx in reviewed_indices:
+                for i, idx in enumerate(reviewed_indices):
                     pixmap = self.load_frame_data(idx)
                     if pixmap:
                         img_rgb = self.pixmap_to_rgb_array(pixmap)
                         chunk_images.append(img_rgb)
+                        
+                        # Export each individual frame as separate image
+                        img_bgr = cv2.cvtColor(img_rgb, cv2.COLOR_RGB2BGR)
+                        frame_filename = f"{prefix}_chunk_{chunk_index:03d}_frame_{i+1:02d}_f{idx:04d}.jpg"
+                        frame_path = os.path.join(chunk_dir, frame_filename)
+                        cv2.imwrite(frame_path, img_bgr, [cv2.IMWRITE_JPEG_QUALITY, 95])
                     else:
                         chunk_images.append(np.zeros((256, 256, 3), dtype=np.uint8))
                         
+                # Export 1fps keyframe video containing the reviewed keyframes
+                status_label.setText(
+                    f"Processing chunk {chunk_index}/{len(chunk_plan)}: "
+                    f"Writing 1fps keyframe video..."
+                )
+                QApplication.processEvents()
+                
+                video_1fps_filename = f"{prefix}_chunk_{chunk_index:03d}_1fps.mp4"
+                video_1fps_path = os.path.join(chunk_dir, video_1fps_filename)
+                self.write_mp4_file(
+                    video_1fps_path,
+                    reviewed_indices,
+                    quality,
+                    preset,
+                    progress_callback=None,
+                    fps=1,
+                )
+
                 all_images.extend(chunk_images)
                 selection_details.append({
                     "chunk_index": chunk_index - 1,
@@ -3173,16 +3202,19 @@ Rules:
             saved_grids = []
             for i, grid in enumerate(grids):
                 if per_chunk_grid:
+                    chunk_dir_name = f"{prefix}_chunk_{i+1:03d}"
                     grid_filename = f"{prefix}_chunk_{i+1:03d}_grid_{best_dim}x{best_dim}.jpg"
+                    grid_path = os.path.join(output_folder, chunk_dir_name, grid_filename)
+                    saved_grids.append(f"{chunk_dir_name}/{grid_filename}")
                 else:
                     grid_filename = f"{prefix}_grid_{best_dim}x{best_dim}_{i:03d}.jpg"
-                grid_path = os.path.join(output_folder, grid_filename)
+                    grid_path = os.path.join(output_folder, grid_filename)
+                    saved_grids.append(grid_filename)
                 
                 # Write to disk
                 frame_bgr = cv2.cvtColor(grid, cv2.COLOR_RGB2BGR)
                 params = [cv2.IMWRITE_JPEG_QUALITY, 95]
                 cv2.imwrite(grid_path, frame_bgr, params)
-                saved_grids.append(grid_filename)
                 
             metadata = {}
             for detail in selection_details:

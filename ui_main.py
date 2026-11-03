@@ -197,13 +197,31 @@ class MainWindow(QMainWindow):
         right_layout.addWidget(self.bookmark_list)
 
         bookmark_button_row = QHBoxLayout()
-        self.add_bookmark_btn = QPushButton("+ Add Bookmark")
-        self.add_bookmark_btn.clicked.connect(self.handle_bookmark_button)
+        bookmark_button_row.setSpacing(4)
+
+        self.add_bookmark_btn = QPushButton("+")
+        self.add_bookmark_btn.setFixedSize(28, 28)
+        self.add_bookmark_btn.setStyleSheet("font-size: 14px; font-weight: bold; padding: 0;")
+        self.add_bookmark_btn.setToolTip("Add bookmark at current frame")
+        self.add_bookmark_btn.clicked.connect(self.add_bookmark)
         bookmark_button_row.addWidget(self.add_bookmark_btn)
 
-        self.clear_bookmarks_btn = QPushButton("Clear Bookmarks")
+        self.remove_bookmark_btn = QPushButton("−")
+        self.remove_bookmark_btn.setFixedSize(28, 28)
+        self.remove_bookmark_btn.setStyleSheet("font-size: 14px; font-weight: bold; padding: 0;")
+        self.remove_bookmark_btn.setToolTip("Remove bookmark at current frame")
+        self.remove_bookmark_btn.clicked.connect(self.remove_current_bookmark)
+        self.remove_bookmark_btn.setEnabled(False)
+        bookmark_button_row.addWidget(self.remove_bookmark_btn)
+
+        self.clear_bookmarks_btn = QPushButton("🗑")
+        self.clear_bookmarks_btn.setFixedSize(28, 28)
+        self.clear_bookmarks_btn.setStyleSheet("font-size: 12px; padding: 0;")
+        self.clear_bookmarks_btn.setToolTip("Delete all bookmarks")
         self.clear_bookmarks_btn.clicked.connect(self.delete_all_bookmarks)
         bookmark_button_row.addWidget(self.clear_bookmarks_btn)
+
+        bookmark_button_row.addStretch()
         right_layout.addLayout(bookmark_button_row)
 
         top_splitter.addWidget(right_panel)
@@ -436,13 +454,15 @@ class MainWindow(QMainWindow):
         # Overview bar (thin, full-width, no thumbnails)
         self.overview_timeline = OverviewTimelineWidget(self)
         self.overview_timeline.frame_selected.connect(self.seek_to_frame)
-        self.overview_timeline.bookmark_hovered.connect(self.on_timeline_bookmark_hovered)
+        self.overview_timeline.bookmark_selected.connect(self.on_bookmark_selected)
+        self.overview_timeline.bookmark_moved.connect(self.on_bookmark_moved)
         self.timeline_layout.addWidget(self.overview_timeline)
 
         # Thumbnail timeline (scrollable, for fine scrubbing)
         self.timeline = TimelineWidget(self)
         self.timeline.frame_selected.connect(self.seek_to_frame)
-        self.timeline.bookmark_hovered.connect(self.on_timeline_bookmark_hovered)
+        self.timeline.bookmark_selected.connect(self.on_bookmark_selected)
+        self.timeline.bookmark_moved.connect(self.on_bookmark_moved)
 
         self.timeline_scroll = QScrollArea()
         self.timeline_scroll.setWidgetResizable(True)
@@ -479,7 +499,6 @@ class MainWindow(QMainWindow):
 
     def init_bookmark_panel(self):
         self.bookmarks = []
-        self.hovered_timeline_bookmark_frame = None
         self.update_bookmark_button_state()
 
     def get_settings_path(self):
@@ -521,10 +540,11 @@ class MainWindow(QMainWindow):
         self.frame_cache = {}
         self.timeline.thumbnails.clear()
         self.timeline.bookmarks.clear()
+        self.timeline.selected_bookmark = -1
         self.timeline.set_playhead(0)
         self.overview_timeline.bookmarks.clear()
+        self.overview_timeline.selected_bookmark = -1
         self.overview_timeline.set_playhead(0)
-        self.hovered_timeline_bookmark_frame = None
         if clear_bookmarks:
             self.bookmarks = []
             self.update_bookmark_list()
@@ -1551,7 +1571,10 @@ class MainWindow(QMainWindow):
     def on_bookmark_clicked(self, item):
         bookmark_data = item.data(Qt.ItemDataRole.UserRole)
         if bookmark_data:
-            self.seek_to_frame(bookmark_data["frame"])
+            frame = bookmark_data["frame"]
+            self.seek_to_frame(frame)
+            self.timeline.select_bookmark(frame)
+            self.overview_timeline.select_bookmark(frame)
 
     def get_bookmark_for_frame(self, frame):
         for bookmark in self.bookmarks:
@@ -1559,47 +1582,62 @@ class MainWindow(QMainWindow):
                 return bookmark
         return None
 
-    def on_timeline_bookmark_hovered(self, frame):
-        self.hovered_timeline_bookmark_frame = frame if frame >= 0 else None
-        self.update_bookmark_button_state()
-
     def update_bookmark_button_state(self):
         if not hasattr(self, "add_bookmark_btn"):
             return
 
-        target_frame = self.hovered_timeline_bookmark_frame
-        if target_frame is not None:
-            bookmark = self.get_bookmark_for_frame(target_frame)
-            if bookmark:
-                self.add_bookmark_btn.setText("- Remove Bookmark")
-                self.add_bookmark_btn.setToolTip(
-                    f"Remove bookmark at frame {target_frame + 1}"
-                )
-                return
+        has_bookmark = self.get_bookmark_for_frame(self.current_frame) is not None
+        self.add_bookmark_btn.setEnabled(not has_bookmark)
+        if hasattr(self, "remove_bookmark_btn"):
+            self.remove_bookmark_btn.setEnabled(has_bookmark)
+        if hasattr(self, "clear_bookmarks_btn"):
+            self.clear_bookmarks_btn.setEnabled(bool(self.bookmarks))
 
-        current_bookmark = self.get_bookmark_for_frame(self.current_frame)
-        if current_bookmark:
-            self.add_bookmark_btn.setText("- Remove Bookmark")
-            self.add_bookmark_btn.setToolTip(
-                f"Remove bookmark at the current frame ({self.current_frame + 1})"
-            )
-        else:
-            self.add_bookmark_btn.setText("+ Add Bookmark")
-            self.add_bookmark_btn.setToolTip(
-                f"Add a bookmark at the current frame ({self.current_frame + 1})"
-            )
-
-    def handle_bookmark_button(self):
-        target_frame = self.hovered_timeline_bookmark_frame
-        if target_frame is not None and self.get_bookmark_for_frame(target_frame):
-            self.delete_bookmark_by_frame(target_frame)
-            return
-
+    def remove_current_bookmark(self):
+        """Remove the bookmark at the current frame."""
         if self.get_bookmark_for_frame(self.current_frame):
             self.delete_bookmark_by_frame(self.current_frame)
-            return
 
-        self.add_bookmark()
+    def on_bookmark_selected(self, frame):
+        """Sync bookmark selection across both timelines and highlight in list."""
+        sender = self.sender()
+        # Sync selection to the other timeline
+        if sender is self.timeline:
+            self.overview_timeline.selected_bookmark = frame
+            self.overview_timeline.update()
+        elif sender is self.overview_timeline:
+            self.timeline.selected_bookmark = frame
+            self.timeline.update()
+
+        # Highlight the corresponding item in the bookmark list
+        if frame >= 0:
+            for i in range(self.bookmark_list.count()):
+                item = self.bookmark_list.item(i)
+                bm_data = item.data(Qt.ItemDataRole.UserRole)
+                if bm_data and bm_data.get("frame") == frame:
+                    self.bookmark_list.setCurrentItem(item)
+                    return
+        self.bookmark_list.clearSelection()
+
+    def on_bookmark_moved(self, old_frame, new_frame):
+        """Handle a bookmark being dragged to a new position on a timeline."""
+        # Update the bookmark data
+        for bm in self.bookmarks:
+            if bm["frame"] == old_frame:
+                bm["frame"] = new_frame
+                break
+
+        # Sync the move across both timelines
+        for tl in (getattr(self, "timeline", None), getattr(self, "overview_timeline", None)):
+            if tl is not None:
+                if old_frame in tl.bookmarks:
+                    tl.remove_bookmark(old_frame)
+                tl.add_bookmark(new_frame)
+                tl.selected_bookmark = new_frame
+                tl.update()
+
+        self.update_bookmark_list()
+        self.update_bookmark_button_state()
 
     def add_bookmark(self):
         if self.total_frames == 0:
@@ -1616,9 +1654,11 @@ class MainWindow(QMainWindow):
         }
 
         self.bookmarks.append(bookmark)
-        self.update_bookmark_list()
         self.timeline.add_bookmark(self.current_frame)
         self.overview_timeline.add_bookmark(self.current_frame)
+        self.timeline.select_bookmark(self.current_frame)
+        self.overview_timeline.select_bookmark(self.current_frame)
+        self.update_bookmark_list()
         self.update_bookmark_button_state()
 
     def update_bookmark_list(self):
@@ -1632,6 +1672,14 @@ class MainWindow(QMainWindow):
             item.setForeground(color)
 
             self.bookmark_list.addItem(item)
+
+        if hasattr(self, "timeline") and self.timeline.selected_bookmark >= 0:
+            for i in range(self.bookmark_list.count()):
+                item = self.bookmark_list.item(i)
+                bm_data = item.data(Qt.ItemDataRole.UserRole)
+                if bm_data and bm_data.get("frame") == self.timeline.selected_bookmark:
+                    self.bookmark_list.setCurrentItem(item)
+                    break
 
         if hasattr(self, "clear_bookmarks_btn"):
             self.clear_bookmarks_btn.setEnabled(bool(self.bookmarks))
@@ -1671,8 +1719,11 @@ class MainWindow(QMainWindow):
         self.bookmarks = [b for b in self.bookmarks if b["frame"] != frame]
         self.timeline.remove_bookmark(frame)
         self.overview_timeline.remove_bookmark(frame)
-        if self.hovered_timeline_bookmark_frame == frame:
-            self.hovered_timeline_bookmark_frame = None
+        # Clear selection on both timelines if needed
+        if self.timeline.selected_bookmark == frame:
+            self.timeline.selected_bookmark = -1
+        if self.overview_timeline.selected_bookmark == frame:
+            self.overview_timeline.selected_bookmark = -1
         self.update_bookmark_list()
 
     def delete_bookmark(self, item):
@@ -1697,10 +1748,11 @@ class MainWindow(QMainWindow):
 
         self.bookmarks = []
         self.timeline.bookmarks.clear()
+        self.timeline.selected_bookmark = -1
         self.timeline.update()
         self.overview_timeline.bookmarks.clear()
+        self.overview_timeline.selected_bookmark = -1
         self.overview_timeline.update()
-        self.hovered_timeline_bookmark_frame = None
         self.update_bookmark_list()
 
     def save_project(self):

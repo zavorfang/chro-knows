@@ -1,11 +1,12 @@
 from PyQt6.QtWidgets import QWidget, QScrollArea, QHBoxLayout, QVBoxLayout, QLabel
 from PyQt6.QtCore import Qt, QRect, QSize, pyqtSignal, QPoint
-from PyQt6.QtGui import QPainter, QColor, QPen, QBrush, QPixmap, QMouseEvent, QFont
+from PyQt6.QtGui import QPainter, QColor, QPen, QBrush, QPixmap, QMouseEvent, QFont, QPolygon
 
 
 class TimelineWidget(QWidget):
     frame_selected = pyqtSignal(int)
-    bookmark_hovered = pyqtSignal(int)
+    bookmark_selected = pyqtSignal(int)
+    bookmark_moved = pyqtSignal(int, int)
     
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -19,7 +20,7 @@ class TimelineWidget(QWidget):
         self.playhead = 0
         self.thumbnails = {}
         self.bookmarks = set()
-        self.hovered_bookmark = -1
+        self.selected_bookmark = -1
         
         self.thumbnail_size = 64
         self.frame_width = 8
@@ -28,6 +29,10 @@ class TimelineWidget(QWidget):
         self.out_point = None
         
         self.dragging_playhead = False
+        self._dragging_bookmark = False
+        self._drag_bookmark_original_frame = -1
+        self._drag_bookmark_current_frame = -1
+        self._bookmark_press_pos = None
         
     def set_total_frames(self, frames):
         self.total_frames = frames
@@ -48,23 +53,35 @@ class TimelineWidget(QWidget):
     def remove_bookmark(self, frame):
         if frame in self.bookmarks:
             self.bookmarks.remove(frame)
+            if self.selected_bookmark == frame:
+                self.selected_bookmark = -1
             self.update()
 
     def _bookmark_from_pos(self, pos):
         frame_offset = 50
         if pos.y() < 0 or pos.y() > 24:
             return -1
+        hit_radius = max(6, self.frame_width // 2)
         for bookmark_frame in self.bookmarks:
             bookmark_x = frame_offset + bookmark_frame * self.frame_width
-            if abs(pos.x() - bookmark_x) <= 6:
+            if abs(pos.x() - bookmark_x) <= hit_radius:
                 return bookmark_frame
         return -1
 
-    def _set_hovered_bookmark(self, frame):
-        if frame == self.hovered_bookmark:
+    def select_bookmark(self, frame):
+        """Select a bookmark and emit the selection signal."""
+        if frame == self.selected_bookmark:
             return
-        self.hovered_bookmark = frame
-        self.bookmark_hovered.emit(frame)
+        self.selected_bookmark = frame
+        self.update()
+        self.bookmark_selected.emit(frame)
+
+    def clear_selection(self):
+        """Deselect the currently selected bookmark, if any."""
+        if self.selected_bookmark != -1:
+            self.selected_bookmark = -1
+            self.update()
+            self.bookmark_selected.emit(-1)
     
     def paintEvent(self, event):
         painter = QPainter(self)
@@ -127,11 +144,33 @@ class TimelineWidget(QWidget):
             painter.setBrush(QBrush(QColor(255, 255, 0, 100)))
             painter.drawRect(ox - 10, 0, 10, self.height())
         
+        # Bookmark markers
         for bookmark_frame in self.bookmarks:
             bx = frame_offset + bookmark_frame * self.frame_width
-            painter.setPen(QColor(255, 107, 53))
-            painter.setBrush(QBrush(QColor(255, 107, 53)))
-            painter.drawEllipse(bx - 4, 5, 8, 8)
+            is_selected = (bookmark_frame == self.selected_bookmark)
+            is_being_dragged = (self._dragging_bookmark
+                                and bookmark_frame == self._drag_bookmark_original_frame)
+            
+            if is_being_dragged:
+                # Ghost at original position (dimmed)
+                painter.setPen(Qt.PenStyle.NoPen)
+                painter.setBrush(QBrush(QColor(255, 107, 53, 80)))
+                painter.drawEllipse(bx - 4, 5, 8, 8)
+                # Active dot at current drag position
+                drag_x = frame_offset + self._drag_bookmark_current_frame * self.frame_width
+                painter.setPen(QPen(QColor(255, 255, 255), 2))
+                painter.setBrush(QBrush(QColor(255, 107, 53, 200)))
+                painter.drawEllipse(drag_x - 5, 4, 10, 10)
+            elif is_selected:
+                # Selected: white highlight ring
+                painter.setPen(QPen(QColor(255, 255, 255), 2))
+                painter.setBrush(QBrush(QColor(255, 107, 53)))
+                painter.drawEllipse(bx - 5, 4, 10, 10)
+            else:
+                # Normal
+                painter.setPen(QColor(255, 107, 53))
+                painter.setBrush(QBrush(QColor(255, 107, 53)))
+                painter.drawEllipse(bx - 4, 5, 8, 8)
         
         playhead_x = frame_offset + self.playhead * self.frame_width
         painter.setPen(QColor(0, 255, 136))
@@ -145,12 +184,23 @@ class TimelineWidget(QWidget):
             QPoint(playhead_x + 6, 0),
             QPoint(playhead_x, 10)
         ]
-        from PyQt6.QtGui import QPolygon
         polygon = QPolygon(triangle)
         painter.drawPolygon(polygon)
     
     def mousePressEvent(self, event):
         if event.button() == Qt.MouseButton.LeftButton:
+            # Check if clicking on a bookmark first
+            clicked_bookmark = self._bookmark_from_pos(event.pos())
+            if clicked_bookmark >= 0:
+                self.select_bookmark(clicked_bookmark)
+                self.playhead = clicked_bookmark
+                self.frame_selected.emit(clicked_bookmark)
+                self._bookmark_press_pos = event.pos()
+                self.update()
+                return
+            
+            # Not on a bookmark — deselect and start playhead drag
+            self.clear_selection()
             frame_offset = 50
             frame = int((event.pos().x() - frame_offset) / self.frame_width)
             
@@ -161,6 +211,24 @@ class TimelineWidget(QWidget):
                 self.update()
     
     def mouseMoveEvent(self, event):
+        if self._bookmark_press_pos is not None and self.selected_bookmark >= 0:
+            # Check drag threshold (3px)
+            delta = event.pos() - self._bookmark_press_pos
+            if not self._dragging_bookmark and abs(delta.x()) < 3:
+                return
+            
+            if not self._dragging_bookmark:
+                self._dragging_bookmark = True
+                self._drag_bookmark_original_frame = self.selected_bookmark
+                self.setCursor(Qt.CursorShape.SizeHorCursor)
+            
+            frame_offset = 50
+            frame = int((event.pos().x() - frame_offset) / self.frame_width)
+            frame = max(0, min(frame, self.total_frames - 1))
+            self._drag_bookmark_current_frame = frame
+            self.update()
+            return
+        
         if self.dragging_playhead:
             frame_offset = 50
             frame = int((event.pos().x() - frame_offset) / self.frame_width)
@@ -170,14 +238,40 @@ class TimelineWidget(QWidget):
             self.frame_selected.emit(frame)
             self.update()
         else:
-            self._set_hovered_bookmark(self._bookmark_from_pos(event.pos()))
+            if self._bookmark_from_pos(event.pos()) >= 0:
+                self.setCursor(Qt.CursorShape.PointingHandCursor)
+            else:
+                self.unsetCursor()
     
     def mouseReleaseEvent(self, event):
         if event.button() == Qt.MouseButton.LeftButton:
+            if self._dragging_bookmark:
+                old_frame = self._drag_bookmark_original_frame
+                new_frame = self._drag_bookmark_current_frame
+                
+                # Commit the move if position changed and destination is free
+                if new_frame != old_frame and new_frame not in self.bookmarks:
+                    self.bookmarks.discard(old_frame)
+                    self.bookmarks.add(new_frame)
+                    self.selected_bookmark = new_frame
+                    self.playhead = new_frame
+                    self.frame_selected.emit(new_frame)
+                    self.bookmark_moved.emit(old_frame, new_frame)
+                else:
+                    self.selected_bookmark = old_frame
+                
+                self._dragging_bookmark = False
+                self._drag_bookmark_original_frame = -1
+                self._drag_bookmark_current_frame = -1
+                self.unsetCursor()
+                self.update()
+            
+            self._bookmark_press_pos = None
             self.dragging_playhead = False
 
     def leaveEvent(self, event):
-        self._set_hovered_bookmark(-1)
+        if not self._dragging_bookmark:
+            self.unsetCursor()
         super().leaveEvent(event)
     
     def wheelEvent(self, event):
@@ -195,7 +289,8 @@ class TimelineWidget(QWidget):
 class OverviewTimelineWidget(QWidget):
     """Thin global navigation bar representing the full video length."""
     frame_selected = pyqtSignal(int)
-    bookmark_hovered = pyqtSignal(int)
+    bookmark_selected = pyqtSignal(int)
+    bookmark_moved = pyqtSignal(int, int)
     
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -210,7 +305,11 @@ class OverviewTimelineWidget(QWidget):
         self.in_point = None
         self.out_point = None
         self._dragging = False
-        self.hovered_bookmark = -1
+        self.selected_bookmark = -1
+        self._dragging_bookmark = False
+        self._drag_bookmark_original_frame = -1
+        self._drag_bookmark_current_frame = -1
+        self._bookmark_press_pos = None
     
     def set_total_frames(self, frames):
         self.total_frames = frames
@@ -226,13 +325,24 @@ class OverviewTimelineWidget(QWidget):
     
     def remove_bookmark(self, frame):
         self.bookmarks.discard(frame)
+        if self.selected_bookmark == frame:
+            self.selected_bookmark = -1
         self.update()
 
-    def _set_hovered_bookmark(self, frame):
-        if frame == self.hovered_bookmark:
+    def select_bookmark(self, frame):
+        """Select a bookmark and emit the selection signal."""
+        if frame == self.selected_bookmark:
             return
-        self.hovered_bookmark = frame
-        self.bookmark_hovered.emit(frame)
+        self.selected_bookmark = frame
+        self.update()
+        self.bookmark_selected.emit(frame)
+
+    def clear_selection(self):
+        """Deselect the currently selected bookmark, if any."""
+        if self.selected_bookmark != -1:
+            self.selected_bookmark = -1
+            self.update()
+            self.bookmark_selected.emit(-1)
     
     def _frame_from_x(self, x):
         if self.total_frames <= 0:
@@ -254,7 +364,7 @@ class OverviewTimelineWidget(QWidget):
             return -1
         for bookmark_frame in self.bookmarks:
             bookmark_x = self._x_from_frame(bookmark_frame)
-            if abs(pos.x() - bookmark_x) <= 4:
+            if abs(pos.x() - bookmark_x) <= 5:
                 return bookmark_frame
         return -1
     
@@ -283,9 +393,30 @@ class OverviewTimelineWidget(QWidget):
         # Bookmark markers
         for bm in self.bookmarks:
             bx = self._x_from_frame(bm)
-            painter.setPen(Qt.PenStyle.NoPen)
-            painter.setBrush(QColor(255, 107, 53))
-            painter.drawRoundedRect(int(bx) - 1, bar_y, 3, bar_h, 1, 1)
+            is_selected = (bm == self.selected_bookmark)
+            is_being_dragged = (self._dragging_bookmark
+                                and bm == self._drag_bookmark_original_frame)
+            
+            if is_being_dragged:
+                # Ghost at original position
+                painter.setPen(Qt.PenStyle.NoPen)
+                painter.setBrush(QColor(255, 107, 53, 80))
+                painter.drawRoundedRect(int(bx) - 1, bar_y, 3, bar_h, 1, 1)
+                # Active marker at drag position
+                drag_x = self._x_from_frame(self._drag_bookmark_current_frame)
+                painter.setPen(QPen(QColor(255, 255, 255), 1))
+                painter.setBrush(QColor(255, 107, 53, 200))
+                painter.drawRoundedRect(int(drag_x) - 2, bar_y - 1, 5, bar_h + 2, 1, 1)
+            elif is_selected:
+                # Selected: highlighted marker
+                painter.setPen(QPen(QColor(255, 255, 255), 1))
+                painter.setBrush(QColor(255, 107, 53))
+                painter.drawRoundedRect(int(bx) - 2, bar_y - 1, 5, bar_h + 2, 1, 1)
+            else:
+                # Normal
+                painter.setPen(Qt.PenStyle.NoPen)
+                painter.setBrush(QColor(255, 107, 53))
+                painter.drawRoundedRect(int(bx) - 1, bar_y, 3, bar_h, 1, 1)
         
         # Playhead
         painter.setPen(Qt.PenStyle.NoPen)
@@ -297,6 +428,18 @@ class OverviewTimelineWidget(QWidget):
     
     def mousePressEvent(self, event):
         if event.button() == Qt.MouseButton.LeftButton:
+            # Check if clicking on a bookmark first
+            clicked_bookmark = self._bookmark_from_pos(event.pos())
+            if clicked_bookmark >= 0:
+                self.select_bookmark(clicked_bookmark)
+                self.playhead = clicked_bookmark
+                self.frame_selected.emit(clicked_bookmark)
+                self._bookmark_press_pos = event.pos()
+                self.update()
+                return
+            
+            # Not on a bookmark — deselect and start playhead drag
+            self.clear_selection()
             self._dragging = True
             frame = self._frame_from_x(event.pos().x())
             self.playhead = frame
@@ -304,19 +447,52 @@ class OverviewTimelineWidget(QWidget):
             self.update()
     
     def mouseMoveEvent(self, event):
+        if self._bookmark_press_pos is not None and self.selected_bookmark >= 0:
+            # Check drag threshold (3px)
+            delta = event.pos() - self._bookmark_press_pos
+            if not self._dragging_bookmark and abs(delta.x()) < 3:
+                return
+            
+            if not self._dragging_bookmark:
+                self._dragging_bookmark = True
+                self._drag_bookmark_original_frame = self.selected_bookmark
+                self.setCursor(Qt.CursorShape.SizeHorCursor)
+            
+            frame = self._frame_from_x(event.pos().x())
+            frame = max(0, min(frame, self.total_frames - 1))
+            self._drag_bookmark_current_frame = frame
+            self.update()
+            return
+        
         if self._dragging:
             frame = self._frame_from_x(event.pos().x())
             frame = max(0, min(frame, self.total_frames - 1))
             self.playhead = frame
             self.frame_selected.emit(frame)
             self.update()
-        else:
-            self._set_hovered_bookmark(self._bookmark_from_pos(event.pos()))
     
     def mouseReleaseEvent(self, event):
         if event.button() == Qt.MouseButton.LeftButton:
+            if self._dragging_bookmark:
+                old_frame = self._drag_bookmark_original_frame
+                new_frame = self._drag_bookmark_current_frame
+                
+                # Commit the move if position changed and destination is free
+                if new_frame != old_frame and new_frame not in self.bookmarks:
+                    self.bookmarks.discard(old_frame)
+                    self.bookmarks.add(new_frame)
+                    self.selected_bookmark = new_frame
+                    self.playhead = new_frame
+                    self.frame_selected.emit(new_frame)
+                    self.bookmark_moved.emit(old_frame, new_frame)
+                else:
+                    self.selected_bookmark = old_frame
+                
+                self._dragging_bookmark = False
+                self._drag_bookmark_original_frame = -1
+                self._drag_bookmark_current_frame = -1
+                self.setCursor(Qt.CursorShape.PointingHandCursor)
+                self.update()
+            
+            self._bookmark_press_pos = None
             self._dragging = False
-
-    def leaveEvent(self, event):
-        self._set_hovered_bookmark(-1)
-        super().leaveEvent(event)

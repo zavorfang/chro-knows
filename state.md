@@ -19,10 +19,17 @@ This document is the definitive technical summary of the project's current imple
 
 ### 2.2 Bookmarking
 - Bookmarks are stored as frame-indexed entries with name/color metadata.
-- The bookmark panel now includes:
-  - `+ Add Bookmark` / `- Remove Bookmark` contextual button.
-  - `Clear Bookmarks` button for deleting all bookmarks at once.
-- Hovering a bookmark marker on either timeline changes the main bookmark button into a remove action for that hovered bookmark.
+- **Fixed-size icon-only buttons**: The bookmark panel features fixed-size icon-only buttons (`+`, `−`, `🗑`) at 28x28px, eliminating text shifts and panel resizing jitter across adjacent panels.
+  - `+` (Add): Adds a bookmark at the current frame (enabled when the current frame has no bookmark).
+  - `−` (Remove): Removes the bookmark at the current frame (enabled when the current frame has a bookmark).
+  - `🗑` (Clear All): Deletes all bookmarks after confirmation (enabled when bookmarks exist).
+- **Timeline selection & drag editing**:
+  - Bookmarks on both `TimelineWidget` and `OverviewTimelineWidget` are clickable and selectable, rendered with a crisp white highlight ring.
+  - Hovering a bookmark switches the cursor to pointing hand cursor.
+  - Dragging a selected bookmark moves its position smoothly along the timeline with ghost marker and active preview.
+  - Dropping commits the new position, syncs across both timelines, jumps the playhead to the new frame, updates the bookmark list, and prevents collisions (snaps back if destination already has a bookmark).
+  - Bidirectional sync: clicking a bookmark in the panel highlights it on the timeline; selecting/clicking a bookmark on the timeline highlights it in the panel and seeks the playhead.
+  - Removed hover-to-update text coupling, ensuring completely stable panel layout and smooth UX.
 - Right-click bookmark context menu supports exporting a single bookmark image, exporting bookmarks, deleting one bookmark, and deleting all bookmarks.
 
 ### 2.3 Export UI

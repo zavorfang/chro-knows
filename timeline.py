@@ -14,6 +14,7 @@ class TimelineWidget(QWidget):
         self.setMaximumHeight(200)
         self.setStyleSheet("background-color: #2a2a2a;")
         self.setMouseTracking(True)
+        self.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
         
         self.total_frames = 0
         self.current_frame = 0
@@ -82,6 +83,40 @@ class TimelineWidget(QWidget):
             self.selected_bookmark = -1
             self.update()
             self.bookmark_selected.emit(-1)
+
+    def nudge_selected_bookmark(self, delta: int) -> bool:
+        """Nudge the selected bookmark by delta frames (-1 or +1)."""
+        if self.selected_bookmark < 0:
+            return False
+        old_frame = self.selected_bookmark
+        new_frame = old_frame + delta
+        if 0 <= new_frame < self.total_frames and new_frame not in self.bookmarks:
+            self.bookmarks.discard(old_frame)
+            self.bookmarks.add(new_frame)
+            self.selected_bookmark = new_frame
+            self.playhead = new_frame
+            self.update()
+            self.frame_selected.emit(new_frame)
+            self.bookmark_moved.emit(old_frame, new_frame)
+            return True
+        return False
+
+    def keyPressEvent(self, event):
+        key = event.key()
+        if self.selected_bookmark >= 0:
+            if key in (Qt.Key.Key_Left, Qt.Key.Key_Down):
+                if self.nudge_selected_bookmark(-1):
+                    event.accept()
+                    return
+            elif key in (Qt.Key.Key_Right, Qt.Key.Key_Up):
+                if self.nudge_selected_bookmark(1):
+                    event.accept()
+                    return
+            elif key == Qt.Key.Key_Escape:
+                self.clear_selection()
+                event.accept()
+                return
+        super().keyPressEvent(event)
     
     def paintEvent(self, event):
         painter = QPainter(self)
@@ -192,6 +227,7 @@ class TimelineWidget(QWidget):
             # Check if clicking on a bookmark first
             clicked_bookmark = self._bookmark_from_pos(event.pos())
             if clicked_bookmark >= 0:
+                self.setFocus()
                 self.select_bookmark(clicked_bookmark)
                 self.playhead = clicked_bookmark
                 self.frame_selected.emit(clicked_bookmark)
@@ -298,6 +334,7 @@ class OverviewTimelineWidget(QWidget):
         self.setMinimumWidth(100)
         self.setCursor(Qt.CursorShape.PointingHandCursor)
         self.setMouseTracking(True)
+        self.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
         
         self.total_frames = 0
         self.playhead = 0
@@ -343,6 +380,41 @@ class OverviewTimelineWidget(QWidget):
             self.selected_bookmark = -1
             self.update()
             self.bookmark_selected.emit(-1)
+
+
+    def nudge_selected_bookmark(self, delta: int) -> bool:
+        """Nudge the selected bookmark by delta frames (-1 or +1)."""
+        if self.selected_bookmark < 0:
+            return False
+        old_frame = self.selected_bookmark
+        new_frame = old_frame + delta
+        if 0 <= new_frame < self.total_frames and new_frame not in self.bookmarks:
+            self.bookmarks.discard(old_frame)
+            self.bookmarks.add(new_frame)
+            self.selected_bookmark = new_frame
+            self.playhead = new_frame
+            self.update()
+            self.frame_selected.emit(new_frame)
+            self.bookmark_moved.emit(old_frame, new_frame)
+            return True
+        return False
+
+    def keyPressEvent(self, event):
+        key = event.key()
+        if self.selected_bookmark >= 0:
+            if key in (Qt.Key.Key_Left, Qt.Key.Key_Down):
+                if self.nudge_selected_bookmark(-1):
+                    event.accept()
+                    return
+            elif key in (Qt.Key.Key_Right, Qt.Key.Key_Up):
+                if self.nudge_selected_bookmark(1):
+                    event.accept()
+                    return
+            elif key == Qt.Key.Key_Escape:
+                self.clear_selection()
+                event.accept()
+                return
+        super().keyPressEvent(event)
     
     def _frame_from_x(self, x):
         if self.total_frames <= 0:
@@ -431,6 +503,7 @@ class OverviewTimelineWidget(QWidget):
             # Check if clicking on a bookmark first
             clicked_bookmark = self._bookmark_from_pos(event.pos())
             if clicked_bookmark >= 0:
+                self.setFocus()
                 self.select_bookmark(clicked_bookmark)
                 self.playhead = clicked_bookmark
                 self.frame_selected.emit(clicked_bookmark)

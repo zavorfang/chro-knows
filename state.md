@@ -28,6 +28,12 @@ This document is the definitive technical summary of the project's current imple
   - Hovering a bookmark switches the cursor to pointing hand cursor.
   - Dragging a selected bookmark moves its position smoothly along the timeline with ghost marker and active preview.
   - Dropping commits the new position, syncs across both timelines, jumps the playhead to the new frame, updates the bookmark list, and prevents collisions (snaps back if destination already has a bookmark).
+  - **Granular arrow key nudge control**:
+    - When a bookmark is selected on the timeline: `Left` or `Down` arrow moves the bookmark backward by 1 frame (-1); `Right` or `Up` arrow moves it forward by 1 frame (+1).
+    - When a bookmark is selected in the Bookmark panel list: `Left` and `Right` arrow keys nudge it backward/forward by 1 frame.
+    - Global shortcuts: `Alt+Left` and `Alt+Right` nudge the selected bookmark earlier/later from anywhere in the app; pressing `Up`/`Down` in the main window also nudges the selected bookmark by ±1 frame.
+    - Pressing `Escape` deselects the bookmark.
+    - Bound limits (`0..total_frames-1`) and collisions are enforced with status bar alerts.
   - Bidirectional sync: clicking a bookmark in the panel highlights it on the timeline; selecting/clicking a bookmark on the timeline highlights it in the panel and seeks the playhead.
   - Removed hover-to-update text coupling, ensuring completely stable panel layout and smooth UX.
 - Right-click bookmark context menu supports exporting a single bookmark image, exporting bookmarks, deleting one bookmark, and deleting all bookmarks.

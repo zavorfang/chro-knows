@@ -38,7 +38,7 @@ from PyQt6.QtWidgets import (
     QSizePolicy,
     QRadioButton,
 )
-from PyQt6.QtCore import Qt, QTimer, pyqtSignal, QSize, QPointF, QRectF
+from PyQt6.QtCore import Qt, QTimer, pyqtSignal, QSize, QPointF, QRectF, QEvent
 from PyQt6.QtGui import (
     QAction,
     QIcon,
@@ -193,6 +193,7 @@ class MainWindow(QMainWindow):
         self.bookmark_list.customContextMenuRequested.connect(
             self.show_bookmark_context_menu
         )
+        self.bookmark_list.installEventFilter(self)
         right_layout.addWidget(QLabel("Bookmarks"))
         right_layout.addWidget(self.bookmark_list)
 
@@ -443,6 +444,17 @@ class MainWindow(QMainWindow):
         next_action.setShortcut(Qt.Key.Key_Right)
         next_action.triggered.connect(self.next_frame)
         playback_menu.addAction(next_action)
+
+        playback_menu.addSeparator()
+        nudge_earlier_action = QAction("Nudge Selected Bookmark Earlier", self)
+        nudge_earlier_action.setShortcut(QKeySequence("Alt+Left"))
+        nudge_earlier_action.triggered.connect(lambda: self.nudge_selected_bookmark(-1))
+        playback_menu.addAction(nudge_earlier_action)
+
+        nudge_later_action = QAction("Nudge Selected Bookmark Later", self)
+        nudge_later_action.setShortcut(QKeySequence("Alt+Right"))
+        nudge_later_action.triggered.connect(lambda: self.nudge_selected_bookmark(1))
+        playback_menu.addAction(nudge_later_action)
 
         help_menu = menubar.addMenu("Help")
 
@@ -1618,6 +1630,90 @@ class MainWindow(QMainWindow):
                     self.bookmark_list.setCurrentItem(item)
                     return
         self.bookmark_list.clearSelection()
+
+
+
+    def nudge_selected_bookmark(self, delta: int) -> bool:
+        """Nudge whichever bookmark is currently selected by delta frames (-1 or +1)."""
+        target = None
+        if hasattr(self, "timeline") and self.timeline.selected_bookmark >= 0:
+            target = self.timeline
+        elif hasattr(self, "overview_timeline") and self.overview_timeline.selected_bookmark >= 0:
+            target = self.overview_timeline
+
+        if target is None:
+            return False
+
+        if target.total_frames <= 0 and self.total_frames > 0:
+            target.set_total_frames(self.total_frames)
+
+        old_frame = target.selected_bookmark
+        new_frame = old_frame + delta
+        if new_frame < 0 or new_frame >= self.total_frames:
+            self.statusBar().showMessage(
+                f"Cannot nudge bookmark: boundary reached (frame {new_frame + 1}).", 2000
+            )
+            return False
+        if new_frame in target.bookmarks:
+            self.statusBar().showMessage(
+                f"Cannot nudge bookmark: frame {new_frame + 1} already has a bookmark.", 2000
+            )
+            return False
+
+        success = target.nudge_selected_bookmark(delta)
+        if success:
+            self.statusBar().showMessage(f"Bookmark moved to frame {new_frame + 1}", 1500)
+        return success
+
+    def eventFilter(self, watched, event):
+        if watched is getattr(self, "bookmark_list", None) and event.type() == QEvent.Type.KeyPress:
+            if event.key() == Qt.Key.Key_Left:
+                if self.nudge_selected_bookmark(-1):
+                    return True
+            elif event.key() == Qt.Key.Key_Right:
+                if self.nudge_selected_bookmark(1):
+                    return True
+            elif event.key() == Qt.Key.Key_Escape:
+                if hasattr(self, "timeline"):
+                    self.timeline.clear_selection()
+                if hasattr(self, "overview_timeline"):
+                    self.overview_timeline.clear_selection()
+                self.bookmark_list.clearSelection()
+                return True
+        return super().eventFilter(watched, event)
+
+    def keyPressEvent(self, event):
+        focused = QApplication.focusWidget()
+        from PyQt6.QtWidgets import QLineEdit, QAbstractSpinBox
+        if isinstance(focused, (QLineEdit, QAbstractSpinBox)):
+            super().keyPressEvent(event)
+            return
+
+        has_selected = (
+            (hasattr(self, "timeline") and self.timeline.selected_bookmark >= 0)
+            or (hasattr(self, "overview_timeline") and self.overview_timeline.selected_bookmark >= 0)
+        )
+
+        if has_selected:
+            if event.key() == Qt.Key.Key_Up:
+                if self.nudge_selected_bookmark(1):
+                    event.accept()
+                    return
+            elif event.key() == Qt.Key.Key_Down:
+                if self.nudge_selected_bookmark(-1):
+                    event.accept()
+                    return
+            elif event.key() == Qt.Key.Key_Escape:
+                if hasattr(self, "timeline"):
+                    self.timeline.clear_selection()
+                if hasattr(self, "overview_timeline"):
+                    self.overview_timeline.clear_selection()
+                if hasattr(self, "bookmark_list"):
+                    self.bookmark_list.clearSelection()
+                event.accept()
+                return
+
+        super().keyPressEvent(event)
 
     def on_bookmark_moved(self, old_frame, new_frame):
         """Handle a bookmark being dragged to a new position on a timeline."""

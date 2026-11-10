@@ -2,13 +2,14 @@
 
 ## 1. Overview
 
-**KFPlayer** is a PyQt6 desktop review tool for animators and editors who need fast frame-accurate playback, timeline bookmarks, export tools, WAN-safe chunk preparation, and Gemma-powered hard-cut shot detection.
+**KFPlayer** is a PyQt6 desktop review tool for animators and editors who need fast frame-accurate playback, timeline bookmarks, export tools, per-shot contact-sheet grids, WAN-safe chunk preparation, and Gemma-powered hard-cut shot detection.
 
 It supports:
 - video files
 - image sequences
 - bookmark still export
 - bookmark video export
+- per-shot grid image export
 - general MP4 export
 - WAN 2.2-style chunk export
 - Gemma 4 shot detection with timestamp output
@@ -36,6 +37,7 @@ Available export paths:
 - frame / sequence export
 - current / first / last frame image export
 - bookmark export
+- shot-grid export
 - MP4 export
 - WAN preparation export
 
@@ -43,7 +45,19 @@ Bookmark export is unified:
 - `Image Sequence` mode exports bookmark stills.
 - `Video` mode exports a stitched MP4 reel with configurable hold duration, FPS, quality, and speed preset.
 
-### 2.4 WAN Preparation
+### 2.4 Shot Grids
+
+`File -> Export -> Shot Grids...` treats each bookmark as the start of a shot and writes a fully filled contact sheet for every shot.
+
+- Sampling interval defaults to 4 frames, with 2/4/8/12/24 chips and a custom value.
+- Grids snap to 3×3, 4×4 or 5×5 (square by default; compact rectangles optional) so no cell is left black.
+- Long shots split into multiple equal grids instead of becoming unreadably dense.
+- Balanced, Trim and Fill strategies control whether frames are dropped or added to complete a grid.
+- The live shot table shows frames, length, samples, grid layout and real spacing; each shot can be excluded.
+- Output options include PNG/JPEG/TIFF, 2048 px grids, gaps, burned frame numbers, per-shot subfolders, individual frames, a manifest and Smart Grid Splitter sidecars.
+- Export runs in a worker thread and remembers its settings.
+
+### 2.5 WAN Preparation
 WAN preparation is designed for long clips that need WAN-safe chunk sizes.
 
 Key rules:
@@ -55,7 +69,7 @@ Key rules:
 
 It can also generate contact-sheet grids and JSON metadata for selected chunk frames.
 
-### 2.5 Gemma Shot Detection
+### 2.6 Gemma Shot Detection
 The app includes a `Detect Shots with Gemma...` dialog for hard-cut detection.
 
 Pipeline summary:
@@ -102,6 +116,11 @@ The repo includes a dummy `.env` placeholder. Replace it with your real Google A
 
 - [main.py](main.py): app bootstrap and `.env` loading
 - [ui_main.py](ui_main.py): UI, dialogs, exports, Gemma shot detection
+- [shot_grid.py](shot_grid.py): pure shot-grid planning
+- [shot_grid_render.py](shot_grid_render.py): frame readers and grid composition
+- [shot_grid_export.py](shot_grid_export.py): shot-grid export, manifest and sidecars
+- [shot_grid_dialog.py](shot_grid_dialog.py): shot-grid dialog and worker
+- [grid_splitter.py](grid_splitter.py): Smart Grid Splitter
 - [timeline.py](timeline.py): overview and thumbnail timeline widgets
 - [gemma_shot_detection.py](gemma_shot_detection.py): pure shot-detection logic
 - [wan_chunks.py](wan_chunks.py): WAN-safe chunk planning logic

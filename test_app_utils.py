@@ -5,6 +5,7 @@ from app_utils import (
     build_bookmark_video_export_filename,
     build_frame_export_filename,
     build_recent_file_label,
+    build_shot_grid_filename,
     ensure_extension,
     normalize_image_format,
     normalize_recent_files,
@@ -66,6 +67,32 @@ class AppUtilsTests(unittest.TestCase):
     def test_bookmark_video_export_filename_is_predictable(self):
         filename = build_bookmark_video_export_filename("shot 010", ".mp4")
         self.assertEqual(filename, "shot 010_bookmarks.mp4")
+
+    def test_shot_grid_filename_includes_frames_and_layout(self):
+        filename = build_shot_grid_filename(
+            "shot 010", 3, 24, 88, 4, 4, ".png"
+        )
+        self.assertEqual(
+            filename, "shot 010_shot_003_f0025-0089_grid4x4.png"
+        )
+
+    def test_shot_grid_filename_adds_part_only_when_split(self):
+        filename = build_shot_grid_filename(
+            "shot010", 2, 0, 127, 4, 4, ".jpg", part=1, total_parts=2
+        )
+        self.assertEqual(
+            filename, "shot010_shot_002_f0001-0128_grid4x4_part1of2.jpg"
+        )
+        single = build_shot_grid_filename(
+            "shot010", 2, 0, 127, 4, 4, ".jpg", part=1, total_parts=1
+        )
+        self.assertEqual(single, "shot010_shot_002_f0001-0128_grid4x4.jpg")
+
+    def test_shot_grid_filename_sanitizes_parts(self):
+        filename = build_shot_grid_filename(
+            'my:clip', 1, 0, 9, 2, 2, ".png"
+        )
+        self.assertEqual(filename, "my_clip_shot_001_f0001-0010_grid2x2.png")
 
 
 if __name__ == "__main__":

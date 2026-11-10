@@ -54,7 +54,7 @@ class PrepareWanTests(unittest.TestCase):
         window.load_frame_data = MagicMock(return_value=dummy_pixmap)
 
         # Mock write_mp4_file to just touch the file
-        def mock_write_mp4(filepath, frame_numbers, quality, preset="fast", progress_callback=None, fps=None):
+        def mock_write_mp4(filepath, frame_numbers, quality, preset="fast", progress_callback=None, fps=None, *args, **kwargs):
             with open(filepath, "wb") as f:
                 f.write(b"dummy mp4 data")
         window.write_mp4_file = MagicMock(side_effect=mock_write_mp4)

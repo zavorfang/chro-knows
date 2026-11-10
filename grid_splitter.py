@@ -4,15 +4,19 @@ export each cell cropped to the original video resolution.
 
 Position logic
 --------------
-For an NxN grid built from a chunk, each cell corresponds to one selected
-frame.  The grid image is exactly N× the video width and N× the video
-height.  To align cell *i* (0-indexed, row-major) with the viewport the
-grid must be offset by::
+Each cell in a rows × cols grid corresponds to one selected frame.  Grids
+written by the Shot Grids exporter may have rectangular cells, gaps, or a
+different resolution than the source video.  The cell geometry therefore
+comes from the sidecar (``grid_rows``, ``grid_cols``, ``grid_gap``,
+``cell_width``, ``cell_height``) with the old square-grid format as fallback.
 
-    col = i % N
-    row = i // N
-    offset_x = -col * frame_width
-    offset_y = -row * frame_height
+To align cell *i* (0-indexed, row-major) with the viewport the grid must be
+offset by::
+
+    col = i % grid_cols
+    row = i // grid_cols
+    offset_x = -col * (cell_width + gap) * scale
+    offset_y = -row * (cell_height + gap) * scale
 
 A manual nudge (drag) is stored once and re-applied on every frame so the
 user only has to correct misalignment once.
@@ -104,6 +108,9 @@ class _SplitterViewport(QWidget):
 
         self._frame_pixmap: QPixmap | None = None
         self._grid_pixmap: QPixmap | None = None
+        self._grid_rows = 1
+        self._grid_cols = 1
+        self._grid_gap = 0
 
         # Grid transform state
         self._grid_base_offset = QPointF(0, 0)   # algorithmic offset
@@ -128,6 +135,12 @@ class _SplitterViewport(QWidget):
 
     def set_grid(self, pixmap: QPixmap | None):
         self._grid_pixmap = pixmap
+        self.update()
+
+    def set_grid_geometry(self, rows: int, cols: int, gap: int = 0):
+        self._grid_rows = max(1, int(rows))
+        self._grid_cols = max(1, int(cols))
+        self._grid_gap = max(0, int(gap))
         self.update()
 
     def set_base_offset(self, x: float, y: float):
@@ -195,16 +208,19 @@ class _SplitterViewport(QWidget):
             painter.setOpacity(1.0)
 
             # Draw thin cell-boundary lines for reference
-            grid_dim = round(self._grid_pixmap.width() / fw) if fw else 1
-            if grid_dim < 1:
-                grid_dim = 1
+            rows = self._grid_rows
+            cols = self._grid_cols
+            gap = self._grid_gap * scale * self._grid_scale
+            cell_w = max(0.0, (gw - (cols - 1) * gap) / cols)
+            cell_h = max(0.0, (gh - (rows - 1) * gap) / rows)
             pen = QPen(QColor(255, 255, 0, 80), 1, Qt.PenStyle.DashLine)
             painter.setPen(pen)
-            cell_w = gw / grid_dim
-            cell_h = gh / grid_dim
-            for i in range(1, grid_dim):
-                painter.drawLine(QPointF(gx + i * cell_w, gy), QPointF(gx + i * cell_w, gy + gh))
-                painter.drawLine(QPointF(gx, gy + i * cell_h), QPointF(gx + i * cell_w * 0 + gw, gy + i * cell_h))
+            for col in range(1, cols):
+                x = gx + col * (cell_w + gap)
+                painter.drawLine(QPointF(x, gy), QPointF(x, gy + gh))
+            for row in range(1, rows):
+                y = gy + row * (cell_h + gap)
+                painter.drawLine(QPointF(gx, y), QPointF(gx + gw, y))
 
         painter.end()
 
@@ -419,8 +435,17 @@ class SmartGridSplitterDialog(QDialog):
         self._chunk_index = setup_data["chunk_index"]
         self._output_folder = setup_data["output_folder"]
 
-        # Resolve chunk metadata
-        self._grid_dim = self._json_data.get("grid_dim", 2)
+        # Resolve grid metadata. Newer sidecars use rows/cols/gap; older ones
+        # only stored a square grid_dim.
+        legacy_dim = int(self._json_data.get("grid_dim", 2) or 2)
+        self._grid_rows = max(
+            1, int(self._json_data.get("grid_rows", legacy_dim) or legacy_dim)
+        )
+        self._grid_cols = max(
+            1, int(self._json_data.get("grid_cols", legacy_dim) or legacy_dim)
+        )
+        self._grid_gap = max(0, int(self._json_data.get("grid_gap", 0) or 0))
+        self._grid_dim = max(self._grid_rows, self._grid_cols)
         self._frame_w, self._frame_h = _video_dimensions(self._video_path)
 
         # Calculate offset in the grid if multiple chunks share a grid
@@ -429,7 +454,7 @@ class SmartGridSplitterDialog(QDialog):
         for i in range(min(self._chunk_index, len(chunks))):
             current_global_index += len(chunks[i].get("selected_frames_abs", []))
 
-        grid_cap = self._grid_dim * self._grid_dim
+        grid_cap = self._grid_rows * self._grid_cols
         self._grid_cell_offset = current_global_index % grid_cap
 
         # Find the selected frames for this chunk (relative to chunk start)
@@ -441,6 +466,25 @@ class SmartGridSplitterDialog(QDialog):
         # Load grid pixmap once
         self._grid_pixmap = QPixmap(self._grid_path)
 
+        # Cell geometry in source-video pixels. Sidecars written by the Shot
+        # Grids exporter carry it explicitly; otherwise derive it from the
+        # grid image.
+        gap_px = self._grid_gap
+        self._cell_width = int(self._json_data.get("cell_width", 0) or 0)
+        self._cell_height = int(self._json_data.get("cell_height", 0) or 0)
+        if self._cell_width <= 0 and self._grid_pixmap.width() > 0:
+            self._cell_width = max(
+                1,
+                (self._grid_pixmap.width() - (self._grid_cols - 1) * gap_px)
+                // self._grid_cols,
+            )
+        if self._cell_height <= 0 and self._grid_pixmap.height() > 0:
+            self._cell_height = max(
+                1,
+                (self._grid_pixmap.height() - (self._grid_rows - 1) * gap_px)
+                // self._grid_rows,
+            )
+
         # Navigation state
         self._nav_index = 0  # index into self._chunk_frames_relative
         # Per-frame nudge: dict mapping frame index -> QPointF
@@ -448,6 +492,10 @@ class SmartGridSplitterDialog(QDialog):
         self._aspect_locked = True
 
         self._build_ui()
+        self._viewport.set_grid_geometry(
+            self._grid_rows, self._grid_cols, self._grid_gap
+        )
+        self._apply_auto_scale()
         self._navigate_to(0)
 
     # -- chunk resolution ----------------------------------------------------
@@ -532,10 +580,10 @@ class SmartGridSplitterDialog(QDialog):
         scale_lay = QVBoxLayout(scale_group)
         scale_row = QHBoxLayout()
         self._scale_slider = QSlider(Qt.Orientation.Horizontal)
-        self._scale_slider.setRange(10, 300)
+        self._scale_slider.setRange(10, 1000)
         self._scale_slider.setValue(100)
         self._scale_spinbox = QSpinBox()
-        self._scale_spinbox.setRange(10, 300)
+        self._scale_spinbox.setRange(10, 1000)
         self._scale_spinbox.setValue(100)
         self._scale_spinbox.setSuffix("%")
         self._scale_spinbox.setFixedWidth(70)
@@ -597,13 +645,7 @@ class SmartGridSplitterDialog(QDialog):
         pixmap = _load_video_frame(self._video_path, frame_num)
         self._viewport.set_frame(pixmap)
 
-        # Compute algorithmic grid offset for this cell
-        grid_index = index + self._grid_cell_offset
-        col = grid_index % self._grid_dim
-        row = grid_index // self._grid_dim
-        base_x = -col * self._frame_w
-        base_y = -row * self._frame_h
-        self._viewport.set_base_offset(base_x, base_y)
+        self._update_base_offset()
 
         # Restore this frame's own nudge (default to zero if never adjusted)
         nudge = self._nudges.get(index, QPointF(0, 0))
@@ -612,6 +654,33 @@ class SmartGridSplitterDialog(QDialog):
         self._frame_label.setText(f"{index + 1} / {n}")
         self._prev_btn.setEnabled(index > 0)
         self._next_btn.setEnabled(index < n - 1)
+
+    def _apply_auto_scale(self):
+        """Size the overlay so one grid cell matches the source frame."""
+        if self._cell_width <= 0 or self._frame_w <= 0:
+            return
+        auto_scale = self._frame_w / float(self._cell_width)
+        value = int(round(auto_scale * 100))
+        value = max(self._scale_slider.minimum(), min(self._scale_slider.maximum(), value))
+        self._scale_slider.blockSignals(True)
+        self._scale_spinbox.blockSignals(True)
+        self._scale_slider.setValue(value)
+        self._scale_spinbox.setValue(value)
+        self._scale_slider.blockSignals(False)
+        self._scale_spinbox.blockSignals(False)
+        self._viewport.set_scale(value / 100.0)
+
+    def _update_base_offset(self):
+        """Position the current cell under the frame at the current zoom."""
+        if not self._chunk_frames_relative:
+            return
+        grid_index = self._nav_index + self._grid_cell_offset
+        col = grid_index % self._grid_cols
+        row = grid_index // self._grid_cols
+        grid_scale = self._scale_slider.value() / 100.0
+        base_x = -col * (self._cell_width + self._grid_gap) * grid_scale
+        base_y = -row * (self._cell_height + self._grid_gap) * grid_scale
+        self._viewport.set_base_offset(base_x, base_y)
 
     # -- control callbacks ---------------------------------------------------
 
@@ -632,12 +701,14 @@ class SmartGridSplitterDialog(QDialog):
         self._scale_spinbox.setValue(val)
         self._scale_spinbox.blockSignals(False)
         self._viewport.set_scale(val / 100.0)
+        self._update_base_offset()
 
     def _on_scale_spinbox(self, val):
         self._scale_slider.blockSignals(True)
         self._scale_slider.setValue(val)
         self._scale_slider.blockSignals(False)
         self._viewport.set_scale(val / 100.0)
+        self._update_base_offset()
 
     def _on_aspect_toggle(self, checked):
         self._aspect_locked = checked
@@ -664,8 +735,10 @@ class SmartGridSplitterDialog(QDialog):
         self._save_current_nudge()
 
         n = len(self._chunk_frames_relative)
-        dim = self._grid_dim
+        rows = self._grid_rows
+        cols = self._grid_cols
         scale = self._scale_slider.value() / 100.0
+        gap_scaled = self._grid_gap * scale
 
         # Load the grid as a numpy array (BGR)
         grid_bgr = cv2.imread(self._grid_path, cv2.IMREAD_COLOR)
@@ -700,20 +773,20 @@ class SmartGridSplitterDialog(QDialog):
         try:
             for i in range(n):
                 grid_index = i + self._grid_cell_offset
-                col = grid_index % dim
-                row = grid_index // dim
+                col = grid_index % cols
+                row = grid_index // cols
                 nudge_i = self._nudges.get(i, QPointF(0, 0))
 
-                cell_gw = grid_w / dim
-                cell_gh = grid_h / dim
+                cell_gw = (grid_w - (cols - 1) * gap_scaled) / cols
+                cell_gh = (grid_h - (rows - 1) * gap_scaled) / rows
                 # Nudge shifts the grid relative to the frame, so the crop
                 # region shifts in the opposite direction within the grid.
                 nx = nudge_i.x() * scale
                 ny = nudge_i.y() * scale
-                x1 = int(col * cell_gw - nx)
-                y1 = int(row * cell_gh - ny)
-                x2 = int(x1 + cell_gw)
-                y2 = int(y1 + cell_gh)
+                x1 = int(round(col * (cell_gw + gap_scaled) - nx))
+                y1 = int(round(row * (cell_gh + gap_scaled) - ny))
+                x2 = int(round(x1 + cell_gw))
+                y2 = int(round(y1 + cell_gh))
 
                 # Clamp
                 x1 = max(0, min(x1, grid_w))

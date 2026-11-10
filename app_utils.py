@@ -1,5 +1,9 @@
+import json
 import os
 import re
+import shutil
+import subprocess
+import tempfile
 
 
 RECENT_FILES_LIMIT = 20
@@ -126,3 +130,155 @@ def build_bookmark_export_filename(prefix, bookmark_index, frame_num, bookmark_n
 def build_bookmark_video_export_filename(prefix, extension):
     prefix = sanitize_filename_part(prefix)
     return f"{prefix}_bookmarks{extension}"
+
+
+def build_shot_grid_filename(
+    prefix,
+    shot_index,
+    start_frame,
+    end_frame,
+    rows,
+    cols,
+    extension,
+    part=None,
+    total_parts=None,
+):
+    prefix = sanitize_filename_part(prefix)
+    filename = (
+        f"{prefix}_shot_{shot_index:03d}_"
+        f"f{start_frame + 1:04d}-{end_frame + 1:04d}_grid{rows}x{cols}"
+    )
+    if part is not None and total_parts and total_parts > 1:
+        filename += f"_part{part}of{total_parts}"
+    return filename + extension
+
+
+
+def _find_ffprobe():
+    """Return the path to ffprobe, or None."""
+    return shutil.which("ffprobe")
+
+
+def _find_ffmpeg():
+    """Return the path to ffmpeg, or None."""
+    return shutil.which("ffmpeg")
+
+
+def probe_audio_stream(video_path):
+    """Return audio stream info dict or None if no audio track exists.
+
+    Returns: {"codec": "aac", "sample_rate": 48000, "channels": 2, "duration": 12.5}
+    or None.
+    """
+    ffprobe = _find_ffprobe()
+    if not ffprobe:
+        return None
+
+    try:
+        result = subprocess.run(
+            [
+                ffprobe,
+                "-v", "quiet",
+                "-print_format", "json",
+                "-show_streams",
+                "-select_streams", "a:0",
+                video_path,
+            ],
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+        if result.returncode != 0:
+            return None
+
+        data = json.loads(result.stdout)
+        streams = data.get("streams", [])
+        if not streams:
+            return None
+
+        stream = streams[0]
+        return {
+            "codec": stream.get("codec_name", "unknown"),
+            "sample_rate": int(stream.get("sample_rate", 0)),
+            "channels": int(stream.get("channels", 0)),
+            "duration": float(stream.get("duration", 0)),
+        }
+    except Exception:
+        return None
+
+
+def mux_audio_into_mp4(
+    video_only_path,
+    source_media_path,
+    output_path,
+    start_frame,
+    end_frame,
+    fps,
+    pad_frames=0,
+):
+    """Extract audio sub-clip from source, pad with silence if needed,
+    mux with the video-only file, write to output_path.
+
+    Uses system ffmpeg via subprocess.
+    """
+    ffmpeg = _find_ffmpeg()
+    if not ffmpeg:
+        raise RuntimeError("ffmpeg not found on PATH")
+
+    start_time = start_frame / fps
+    source_duration = (end_frame - start_frame + 1) / fps
+    target_duration = source_duration + (pad_frames / fps)
+
+    # Use a temp file to avoid overwriting the input if output_path == video_only_path
+    fd, temp_output = tempfile.mkstemp(suffix=".mp4")
+    os.close(fd)
+
+    try:
+        cmd = [
+            ffmpeg,
+            "-y",
+            "-i", video_only_path,
+            "-ss", f"{start_time:.6f}",
+            "-t", f"{source_duration:.6f}",
+            "-i", source_media_path,
+            "-c:v", "copy",
+            "-c:a", "aac",
+            "-b:a", "192k",
+        ]
+
+        if pad_frames > 0:
+            cmd.extend([
+                "-filter_complex",
+                f"[1:a]apad=whole_dur={target_duration:.6f}[a]",
+                "-map", "0:v:0",
+                "-map", "[a]",
+            ])
+        else:
+            cmd.extend([
+                "-map", "0:v:0",
+                "-map", "1:a:0",
+            ])
+
+        cmd.extend(["-shortest", temp_output])
+
+        result = subprocess.run(
+            cmd,
+            capture_output=True,
+            text=True,
+            timeout=300,
+        )
+
+        if result.returncode != 0:
+            raise RuntimeError(
+                f"ffmpeg mux failed (exit {result.returncode}): {result.stderr[-500:]}"
+            )
+
+        # Move temp to final destination
+        shutil.move(temp_output, output_path)
+
+    finally:
+        if os.path.exists(temp_output):
+            try:
+                os.remove(temp_output)
+            except OSError:
+                pass

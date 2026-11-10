@@ -3,6 +3,7 @@ import os
 import shutil
 import tempfile
 import threading
+import time
 
 from PyQt6.QtWidgets import (
     QMainWindow,
@@ -38,7 +39,8 @@ from PyQt6.QtWidgets import (
     QSizePolicy,
     QRadioButton,
 )
-from PyQt6.QtCore import Qt, QTimer, pyqtSignal, QSize, QPointF, QRectF, QEvent
+from PyQt6.QtCore import Qt, QTimer, pyqtSignal, QSize, QPointF, QRectF, QEvent, QUrl
+from PyQt6.QtMultimedia import QMediaPlayer, QAudioOutput
 from PyQt6.QtGui import (
     QAction,
     QIcon,
@@ -56,6 +58,19 @@ from PyQt6.QtGui import (
 from viewer import ViewerWidget
 from timeline import TimelineWidget, OverviewTimelineWidget
 from project import Project
+from minimax_chunks import (
+    MINIMAX_DEFAULT_CHUNK,
+    MINIMAX_MIN_FRAMES,
+    MINIMAX_OVERLAP_MAX,
+    MINIMAX_OVERLAP_MIN,
+    MINIMAX_STRIDE,
+    MinimaxChunk,
+    normalize_minimax_chunk_size,
+    normalize_minimax_overlap,
+    plan_minimax_chunks,
+    snap_to_minimax_ceil,
+    snap_to_minimax_floor,
+)
 from wan_chunks import (
     WAN_CHUNK_SIZE,
     WAN_OVERLAP_MAX,
@@ -65,7 +80,12 @@ from wan_chunks import (
     plan_wan_chunks,
 )
 from grid_splitter import GridSplitterSetupDialog, SmartGridSplitterDialog
+from shot_grid_dialog import ShotGridDialog, show_shot_grid_export
+from shot_grid_render import ShotGridMedia, compose_grid
 from app_utils import (
+    mux_audio_into_mp4,
+    probe_audio_stream,
+
     IMAGE_EXPORT_FILTER,
     IMAGE_EXPORT_FORMATS,
     build_bookmark_export_filename,
@@ -134,6 +154,19 @@ class MainWindow(QMainWindow):
         self.export_folder = ""
         self.recent_files = []
         self.recent_files_menu = None
+        self.shot_grid_settings = {}
+        self.audio_muted = False
+        self.audio_volume = 80
+        self.audio_enabled = True
+        self._has_audio = False
+        self._audio_player = None
+        self._audio_output = None
+        self._video_cap = None
+        self._video_cap_pos = -1
+        self._play_clock_start = 0.0
+        self._play_frame_start = 0
+        self._effective_fps = 24
+        self._init_audio()
 
         self.load_settings()
 
@@ -158,6 +191,24 @@ class MainWindow(QMainWindow):
         self.status_timer.start(2000)
 
         self.update_status()
+
+    def _init_audio(self):
+        try:
+            self._audio_output = QAudioOutput(self)
+            self._audio_output.setVolume(self.audio_volume / 100.0)
+            self._audio_player = QMediaPlayer(self)
+            self._audio_player.setAudioOutput(self._audio_output)
+        except Exception:
+            self._audio_output = None
+            self._audio_player = None
+
+    def toggle_mute(self):
+        self.audio_muted = not self.audio_muted
+        if self._audio_output:
+            self._audio_output.setMuted(self.audio_muted)
+        if hasattr(self, "mute_btn"):
+            self.mute_btn.setText("🔇" if self.audio_muted else "🔊")
+            self.mute_btn.setToolTip("Unmute (M)" if self.audio_muted else "Mute (M)")
 
     def init_ui(self):
         self.central_widget = QWidget()
@@ -304,6 +355,12 @@ class MainWindow(QMainWindow):
         self.speed_combo.setToolTip("Playback Speed")
         self.speed_combo.currentTextChanged.connect(self.set_speed)
         toolbar.addWidget(self.speed_combo)
+        self.mute_btn = QPushButton("🔊")
+        self.mute_btn.setFixedWidth(40)
+        self.mute_btn.setToolTip("Mute / Unmute (M)")
+        self.mute_btn.clicked.connect(self.toggle_mute)
+        self.mute_btn.setEnabled(False)
+        toolbar.addWidget(self.mute_btn)
 
         toolbar.addSeparator()
 
@@ -387,6 +444,11 @@ class MainWindow(QMainWindow):
         export_bookmarks_action.triggered.connect(self.show_export_bookmarks_dialog)
         export_menu.addAction(export_bookmarks_action)
 
+        self.export_shot_grids_action = QAction("Shot Grids...", self)
+        self.export_shot_grids_action.triggered.connect(self.show_shot_grid_dialog)
+        self.export_shot_grids_action.setEnabled(self.total_frames > 0)
+        export_menu.addAction(self.export_shot_grids_action)
+
         export_mp4_action = QAction("MP4...", self)
         export_mp4_action.triggered.connect(self.show_export_mp4_dialog)
         export_menu.addAction(export_mp4_action)
@@ -394,6 +456,9 @@ class MainWindow(QMainWindow):
         wan_prep_action = QAction("Wan Preparation...", self)
         wan_prep_action.triggered.connect(self.show_wan_preparation_dialog)
         export_menu.addAction(wan_prep_action)
+        minimax_prep_action = QAction("MiniMax H3 Preparation...", self)
+        minimax_prep_action.triggered.connect(self.show_minimax_preparation_dialog)
+        export_menu.addAction(minimax_prep_action)
 
         grid_splitter_action = QAction("Smart Grid Splitter...", self)
         grid_splitter_action.triggered.connect(self.show_grid_splitter_dialog)
@@ -516,6 +581,14 @@ class MainWindow(QMainWindow):
     def get_settings_path(self):
         return os.path.join(os.path.expanduser("~"), ".kfpro_lite_settings.json")
 
+    def update_shot_grid_action_state(self):
+        if hasattr(self, "export_shot_grids_action"):
+            self.export_shot_grids_action.setEnabled(self.total_frames > 0)
+
+    def save_shot_grid_settings(self, settings):
+        self.shot_grid_settings = dict(settings or {})
+        self.save_settings()
+
     def get_default_export_folder(self):
         if self.export_folder and os.path.isdir(self.export_folder):
             return self.export_folder
@@ -549,6 +622,19 @@ class MainWindow(QMainWindow):
         return "kfplayer"
 
     def reset_loaded_media_state(self, clear_bookmarks=True):
+        if getattr(self, "_video_cap", None) is not None:
+            try:
+                self._video_cap.release()
+            except Exception:
+                pass
+            self._video_cap = None
+        self._video_cap_pos = -1
+        if getattr(self, "_audio_player", None) is not None:
+            self._audio_player.stop()
+            self._audio_player.setSource(QUrl())
+        self._has_audio = False
+        if hasattr(self, "mute_btn"):
+            self.mute_btn.setEnabled(False)
         self.frame_cache = {}
         self.timeline.thumbnails.clear()
         self.timeline.bookmarks.clear()
@@ -560,6 +646,7 @@ class MainWindow(QMainWindow):
         if clear_bookmarks:
             self.bookmarks = []
             self.update_bookmark_list()
+        self.update_shot_grid_action_state()
 
     def add_recent_file(self, path, kind):
         self.recent_files = push_recent_file(self.recent_files, path, kind)
@@ -642,11 +729,16 @@ class MainWindow(QMainWindow):
                     self.fps = settings.get("default_fps", 24)
                     self.export_folder = settings.get("export_folder", "")
                     self.audio_scrub = settings.get("audio_scrub", False)
+                    self.audio_muted = settings.get("audio_muted", False)
+                    self.audio_volume = settings.get("audio_volume", 80)
+                    self.audio_enabled = settings.get("audio_enabled", True)
                     self.scrub_sensitivity = settings.get("scrub_sensitivity", 5)
                     self.auto_save_enabled = settings.get("auto_save", True)
                     self.recent_files = normalize_recent_files(
                         settings.get("recent_files", [])
                     )
+                    shot_grid = settings.get("shot_grid", {})
+                    self.shot_grid_settings = shot_grid if isinstance(shot_grid, dict) else {}
             except:
                 pass
 
@@ -657,9 +749,13 @@ class MainWindow(QMainWindow):
             "default_fps": self.fps,
             "export_folder": self.export_folder,
             "audio_scrub": self.audio_scrub,
+            "audio_muted": self.audio_muted,
+            "audio_volume": self.audio_volume,
+            "audio_enabled": self.audio_enabled,
             "scrub_sensitivity": self.scrub_sensitivity,
             "auto_save": self.auto_save_enabled,
             "recent_files": self.recent_files,
+            "shot_grid": self.shot_grid_settings,
         }
         with open(settings_path, "w") as f:
             json.dump(settings, f)
@@ -835,6 +931,33 @@ class MainWindow(QMainWindow):
 
         self.video_width = width
         self.video_height = height
+        # Probe audio
+        audio_info = probe_audio_stream(file_path) if ext != ".gif" else None
+        self._has_audio = bool(audio_info)
+        if getattr(self, "_audio_player", None) and self._has_audio:
+            self._audio_player.setSource(QUrl.fromLocalFile(file_path))
+            if hasattr(self, "mute_btn"):
+                self.mute_btn.setEnabled(True)
+                self.mute_btn.setText("🔇" if self.audio_muted else "🔊")
+                self.mute_btn.setToolTip("Mute / Unmute (M)")
+        else:
+            if getattr(self, "_audio_player", None):
+                self._audio_player.stop()
+                self._audio_player.setSource(QUrl())
+            if hasattr(self, "mute_btn"):
+                self.mute_btn.setEnabled(False)
+                self.mute_btn.setToolTip("No audio track in source")
+
+        if getattr(self, "_video_cap", None) is not None:
+            try:
+                self._video_cap.release()
+            except Exception:
+                pass
+            self._video_cap = None
+        self._video_cap_pos = -1
+        if ext != ".gif":
+            self._video_cap = cv2.VideoCapture(file_path)
+            self._video_cap_pos = 0
 
         # Update UI
         self.update_frame_display()
@@ -981,14 +1104,21 @@ class MainWindow(QMainWindow):
                 except Exception:
                     return None
             else:
-                # Regular video handling with OpenCV
-                cap = cv2.VideoCapture(video_path)
-                if not cap.isOpened():
+                # Regular video handling with persistent OpenCV VideoCapture
+                if getattr(self, "_video_cap", None) is None or not self._video_cap.isOpened():
+                    self._video_cap = cv2.VideoCapture(video_path)
+                    self._video_cap_pos = -1
+
+                if not self._video_cap.isOpened():
                     return None
 
-                cap.set(cv2.CAP_PROP_POS_FRAMES, frame_num)
-                ret, frame = cap.read()
-                cap.release()
+                if self._video_cap_pos == frame_num:
+                    ret, frame = self._video_cap.read()
+                    self._video_cap_pos += 1
+                else:
+                    self._video_cap.set(cv2.CAP_PROP_POS_FRAMES, frame_num)
+                    ret, frame = self._video_cap.read()
+                    self._video_cap_pos = frame_num + 1 if ret else -1
 
                 if not ret:
                     return None
@@ -1051,43 +1181,77 @@ class MainWindow(QMainWindow):
         self.update_frame_display()
         self.sync_timeline_scroll()
         self.update_bookmark_button_state()
+        if self.is_playing:
+            self._play_clock_start = time.perf_counter()
+            self._play_frame_start = frame_num
+        if getattr(self, "_audio_player", None) is not None and self._has_audio:
+            effective_fps = getattr(self, "_effective_fps", self.fps)
+            pos_ms = int(frame_num / max(1, effective_fps) * 1000)
+            self._audio_player.setPosition(pos_ms)
 
     def play_step(self):
-        if self.is_playing:
-            self.current_frame += 1
+        if not self.is_playing:
+            return
 
-            if self.current_frame >= self.total_frames:
-                if self.loop_enabled:
-                    self.current_frame = 0
-                else:
-                    self.is_playing = False
-                    self.play_pause_btn.setText("▶")
-                    self.play_timer.stop()
-                    return
+        elapsed = time.perf_counter() - self._play_clock_start
+        effective_fps = getattr(self, "_effective_fps", self.fps)
+        target = self._play_frame_start + int(elapsed * effective_fps * self.playback_speed)
 
-            self.load_frame(self.current_frame)
-            self.update_frame_display()
-            self.timeline.set_playhead(self.current_frame)
-            self.overview_timeline.set_playhead(self.current_frame)
-            self.sync_timeline_scroll()
-            self.update_bookmark_button_state()
+        if target >= self.total_frames:
+            if self.loop_enabled and self.total_frames > 0:
+                self._play_clock_start = time.perf_counter()
+                self._play_frame_start = 0
+                target = 0
+                if getattr(self, "_audio_player", None) is not None and self._has_audio and not self.audio_muted:
+                    self._audio_player.setPosition(0)
+                    self._audio_player.play()
+            else:
+                self.is_playing = False
+                self.play_pause_btn.setText("▶")
+                self.play_timer.stop()
+                if getattr(self, "_audio_player", None) is not None:
+                    self._audio_player.pause()
+                return
+
+        if target == self.current_frame:
+            return
+
+        self.current_frame = target
+        self.load_frame(self.current_frame)
+        self.update_frame_display()
+        self.timeline.set_playhead(self.current_frame)
+        self.overview_timeline.set_playhead(self.current_frame)
+        self.sync_timeline_scroll()
+        self.update_bookmark_button_state()
 
     def toggle_play(self):
         self.is_playing = not self.is_playing
 
         if self.is_playing:
             self.play_pause_btn.setText("❚❚")
-            # Use video FPS if available, otherwise use project FPS
             fps = self.fps
             if getattr(self.project, "is_video", False) and hasattr(
                 self.project, "video_fps"
             ):
                 fps = int(self.project.video_fps) if self.project.video_fps > 0 else 24
-            interval = int(1000 / (fps * self.playback_speed))
-            self.play_timer.start(interval)
+
+            self._effective_fps = fps
+            self._play_clock_start = time.perf_counter()
+            self._play_frame_start = self.current_frame
+
+            if getattr(self, "_audio_player", None) is not None and self._has_audio and not self.audio_muted:
+                pos_ms = int(self.current_frame / max(1, fps) * 1000)
+                self._audio_player.setPosition(pos_ms)
+                self._audio_player.setPlaybackRate(self.playback_speed)
+                self._audio_player.play()
+
+            interval = max(5, int(1000 / (fps * self.playback_speed * 2)))
+            self.play_timer.start(min(15, interval))
         else:
             self.play_pause_btn.setText("▶")
             self.play_timer.stop()
+            if getattr(self, "_audio_player", None) is not None:
+                self._audio_player.pause()
 
     def prev_frame(self):
         if self.current_frame > 0:
@@ -1097,6 +1261,13 @@ class MainWindow(QMainWindow):
             self.timeline.set_playhead(self.current_frame)
             self.overview_timeline.set_playhead(self.current_frame)
             self.update_bookmark_button_state()
+            if self.is_playing:
+                self._play_clock_start = time.perf_counter()
+                self._play_frame_start = self.current_frame
+            if getattr(self, "_audio_player", None) is not None and self._has_audio:
+                effective_fps = getattr(self, "_effective_fps", self.fps)
+                pos_ms = int(self.current_frame / max(1, effective_fps) * 1000)
+                self._audio_player.setPosition(pos_ms)
 
     def next_frame(self):
         if self.current_frame < self.total_frames - 1:
@@ -1106,6 +1277,13 @@ class MainWindow(QMainWindow):
             self.timeline.set_playhead(self.current_frame)
             self.overview_timeline.set_playhead(self.current_frame)
             self.update_bookmark_button_state()
+            if self.is_playing:
+                self._play_clock_start = time.perf_counter()
+                self._play_frame_start = self.current_frame
+            if getattr(self, "_audio_player", None) is not None and self._has_audio:
+                effective_fps = getattr(self, "_effective_fps", self.fps)
+                pos_ms = int(self.current_frame / max(1, effective_fps) * 1000)
+                self._audio_player.setPosition(pos_ms)
 
     def jump_to_start(self):
         self.current_frame = 0
@@ -1114,6 +1292,11 @@ class MainWindow(QMainWindow):
         self.timeline.set_playhead(0)
         self.overview_timeline.set_playhead(0)
         self.update_bookmark_button_state()
+        if self.is_playing:
+            self._play_clock_start = time.perf_counter()
+            self._play_frame_start = 0
+        if getattr(self, "_audio_player", None) is not None and self._has_audio:
+            self._audio_player.setPosition(0)
 
     def jump_to_end(self):
         self.current_frame = max(0, self.total_frames - 1)
@@ -1122,6 +1305,13 @@ class MainWindow(QMainWindow):
         self.timeline.set_playhead(self.current_frame)
         self.overview_timeline.set_playhead(self.current_frame)
         self.update_bookmark_button_state()
+        if self.is_playing:
+            self._play_clock_start = time.perf_counter()
+            self._play_frame_start = self.current_frame
+        if getattr(self, "_audio_player", None) is not None and self._has_audio:
+            effective_fps = getattr(self, "_effective_fps", self.fps)
+            pos_ms = int(self.current_frame / max(1, effective_fps) * 1000)
+            self._audio_player.setPosition(pos_ms)
 
     def toggle_loop(self):
         self.loop_enabled = not self.loop_enabled
@@ -1131,9 +1321,13 @@ class MainWindow(QMainWindow):
         self.playback_speed = speed_map.get(speed_text, 1.0)
 
         if self.is_playing:
-            self.play_timer.stop()
-            interval = int(1000 / (self.fps * self.playback_speed))
-            self.play_timer.start(interval)
+            self._play_clock_start = time.perf_counter()
+            self._play_frame_start = self.current_frame
+            effective_fps = getattr(self, "_effective_fps", self.fps)
+            interval = max(5, int(1000 / (effective_fps * self.playback_speed * 2)))
+            self.play_timer.setInterval(min(15, interval))
+            if getattr(self, "_audio_player", None) is not None and self._has_audio:
+                self._audio_player.setPlaybackRate(self.playback_speed)
 
     def update_frame_display(self):
         res_str = ""
@@ -1143,6 +1337,7 @@ class MainWindow(QMainWindow):
         self.frame_label.setText(
             f"Frame: {self.current_frame + 1} / {self.total_frames}{res_str}"
         )
+        self.update_shot_grid_action_state()
 
         total_seconds = self.current_frame / self.fps
         hours = int(total_seconds // 3600)
@@ -1688,6 +1883,10 @@ class MainWindow(QMainWindow):
         if isinstance(focused, (QLineEdit, QAbstractSpinBox)):
             super().keyPressEvent(event)
             return
+        if event.key() == Qt.Key.Key_M:
+            self.toggle_mute()
+            event.accept()
+            return
 
         has_selected = (
             (hasattr(self, "timeline") and self.timeline.selected_bookmark >= 0)
@@ -2004,8 +2203,9 @@ class MainWindow(QMainWindow):
             filepath, _ = QFileDialog.getSaveFileName(
                 self, "Export MP4", "", "MP4 Video (*.mp4)"
             )
+            include_audio = getattr(dialog, "include_audio_checkbox", None) and dialog.include_audio_checkbox.isChecked()
             if filepath:
-                self.export_mp4(filepath, start_frame, end_frame, quality, preset)
+                self.export_mp4(filepath, start_frame, end_frame, quality, preset, include_audio=include_audio)
 
     def show_wan_preparation_dialog(self):
         if self.total_frames == 0:
@@ -2033,10 +2233,314 @@ class MainWindow(QMainWindow):
                 QMessageBox.warning(self, "Export", "Please choose an output folder.")
                 return
 
+            include_audio = getattr(dialog, "include_audio_checkbox", None) and dialog.include_audio_checkbox.isChecked()
             self.prepare_wan(
                 output_folder, prefix, chunk_size, overlap, quality, preset,
-                start_frame, end_frame, grid_size, per_chunk_grid
+                start_frame, end_frame, grid_size, per_chunk_grid, include_audio=include_audio
             )
+
+    def show_minimax_preparation_dialog(self):
+        if self.total_frames == 0:
+            QMessageBox.warning(self, "Export", "No project loaded.")
+            return
+
+        dialog = MinimaxPreparationDialog(self)
+        if dialog.exec() == QDialog.DialogCode.Accepted:
+            output_folder = dialog.output_folder.text().strip()
+            prefix = dialog.filename_prefix.text().strip()
+            chunk_size = dialog.get_chunk_size()
+            overlap = dialog.get_overlap()
+            quality = dialog.quality_slider.value()
+            preset = dialog.speed_combo.currentText()
+            start_frame = dialog.start_spinbox.value()
+            end_frame = dialog.end_spinbox.value()
+            grid_size = dialog.grid_combo.currentData()
+            per_chunk_grid = dialog.per_chunk_grid_checkbox.isChecked()
+            include_audio = getattr(dialog, "include_audio_checkbox", None) and dialog.include_audio_checkbox.isChecked()
+
+            if start_frame > end_frame:
+                QMessageBox.warning(self, "Invalid Range", "Start frame must be before end frame.")
+                return
+
+            if not output_folder:
+                QMessageBox.warning(self, "Export", "Please choose an output folder.")
+                return
+
+            self.prepare_minimax(
+                output_folder, prefix, chunk_size, overlap, quality, preset,
+                start_frame, end_frame, grid_size, per_chunk_grid, include_audio=include_audio
+            )
+
+    def prepare_minimax(
+        self, output_folder, prefix, chunk_size, overlap, quality, preset,
+        start_frame, end_frame, grid_size, per_chunk_grid=False, include_audio=False
+    ):
+        chunk_size = normalize_minimax_chunk_size(chunk_size)
+        overlap = normalize_minimax_overlap(overlap, chunk_size)
+        
+        total_frames_to_chunk = end_frame - start_frame + 1
+        chunk_plan = plan_minimax_chunks(total_frames_to_chunk, chunk_size, overlap)
+        if not chunk_plan:
+            QMessageBox.warning(self, "Export", "No frames available for export.")
+            return
+
+        prefix = sanitize_filename_part(prefix)
+        
+        num_chunks = len(chunk_plan)
+        preferred_dim = None
+        if grid_size == "2x2": preferred_dim = 2
+        elif grid_size == "3x3": preferred_dim = 3
+        
+        dims = [preferred_dim] if preferred_dim else [3, 2]
+        if num_chunks == 1 and not preferred_dim:
+            best_k, best_dim = 4, 2
+        elif num_chunks == 3 and not preferred_dim:
+            best_k, best_dim = 3, 3
+        else:
+            best_k, best_dim = None, None
+            for k in range(3, 6):
+                for dim in dims:
+                    cap = dim * dim
+                    if (num_chunks * k) % cap == 0:
+                        best_k, best_dim = k, dim
+                        break
+                if best_k is not None:
+                    break
+            
+            if best_k is None:
+                best_k = 3
+                if preferred_dim:
+                    best_dim = preferred_dim
+                else:
+                    best_dim = dims[0]
+                    best_waste = float("inf")
+                    for dim in dims:
+                        cap = dim * dim
+                        waste = (cap - ((num_chunks * best_k) % cap)) % cap
+                        if waste < best_waste:
+                            best_waste = waste
+                            best_dim = dim
+
+        cap = best_dim * best_dim
+        if per_chunk_grid:
+            k_list = [cap] * num_chunks
+            best_k = cap
+        else:
+            base_total = num_chunks * best_k
+            missing = (cap - (base_total % cap)) % cap
+            k_list = [best_k] * num_chunks
+            for i in range(missing):
+                k_list[i % num_chunks] += 1
+
+        review_data = []
+        for chunk_index, chunk in enumerate(chunk_plan):
+            abs_start = start_frame + chunk.start_frame
+            abs_end_raw = start_frame + chunk.end_frame
+            abs_end = min(abs_end_raw, end_frame)
+
+            k_i = k_list[chunk_index]
+            span = abs_end - abs_start
+            if span == 0:
+                indices = [abs_start] * k_i
+            else:
+                indices = [abs_start + i * span // (k_i - 1) for i in range(k_i)]
+
+            review_data.append({
+                "chunk_index": chunk_index,
+                "abs_start": abs_start,
+                "abs_end": abs_end,
+                "selected_frames": list(indices),
+            })
+
+        review = WanFrameReviewDialog(self, review_data, self.load_frame_data)
+        if review.exec() != QDialog.DialogCode.Accepted:
+            return
+
+        reviewed_data = review.get_all_selected_frames()
+        total_mp4_frames = sum(chunk.target_length for chunk in chunk_plan)
+
+        progress = QDialog(self)
+        progress.setWindowTitle("MiniMax H3 Preparation...")
+        progress.setFixedSize(420, 130)
+        prog_layout = QVBoxLayout(progress)
+        status_label = QLabel()
+        status_label.setWordWrap(True)
+        prog_layout.addWidget(status_label)
+        bar = QProgressBar()
+        bar.setRange(0, total_mp4_frames)
+        prog_layout.addWidget(bar)
+        progress.show()
+
+        completed_frames = 0
+        all_images = []
+        selection_details = []
+
+        import cv2
+        import numpy as np
+        from dataclasses import asdict
+
+        try:
+            os.makedirs(output_folder, exist_ok=True)
+
+            for chunk_index, chunk in enumerate(chunk_plan, start=1):
+                abs_start = start_frame + chunk.start_frame
+                abs_end_raw = start_frame + chunk.end_frame
+                abs_end = min(abs_end_raw, end_frame)
+                
+                chunk_dir_name = f"{prefix}_chunk_{chunk_index:03d}"
+                chunk_dir = os.path.join(output_folder, chunk_dir_name)
+                os.makedirs(chunk_dir, exist_ok=True)
+
+                filename = (
+                    f"{prefix}_minimax_h3_{chunk_index:03d}_"
+                    f"{chunk.target_length:03d}f_"
+                    f"{abs_start:04d}-{abs_end:04d}.mp4"
+                )
+                filepath = os.path.join(chunk_dir, filename)
+
+                frame_numbers = list(range(abs_start, abs_end + 1))
+                pad_needed = chunk.target_length - len(frame_numbers)
+                if pad_needed > 0:
+                    frame_numbers.extend([abs_end] * pad_needed)
+
+                status_label.setText(
+                    f"Processing chunk {chunk_index}/{len(chunk_plan)}: "
+                    f"frames {abs_start}-{abs_end}"
+                )
+                QApplication.processEvents()
+
+                def update_progress(output_index, total, source_frame, base=completed_frames):
+                    bar.setValue(base + output_index)
+                    QApplication.processEvents()
+
+                write_kwargs = {}
+                if include_audio:
+                    write_kwargs["include_audio"] = True
+                    write_kwargs["audio_start_frame"] = abs_start
+                    write_kwargs["audio_end_frame"] = abs_end
+                self.write_mp4_file(
+                    filepath,
+                    frame_numbers,
+                    quality,
+                    preset,
+                    progress_callback=update_progress,
+                    **write_kwargs
+                )
+
+                completed_frames += len(frame_numbers)
+                reviewed_indices = reviewed_data[chunk_index - 1]["selected_frames"]
+
+                chunk_images = []
+                for i, idx in enumerate(reviewed_indices):
+                    pixmap = self.load_frame_data(idx)
+                    if pixmap:
+                        img_rgb = self.pixmap_to_rgb_array(pixmap)
+                        chunk_images.append(img_rgb)
+                        img_bgr = cv2.cvtColor(img_rgb, cv2.COLOR_RGB2BGR)
+                        frame_filename = f"{prefix}_chunk_{chunk_index:03d}_frame_{i+1:02d}_f{idx:04d}.jpg"
+                        frame_path = os.path.join(chunk_dir, frame_filename)
+                        cv2.imwrite(frame_path, img_bgr, [cv2.IMWRITE_JPEG_QUALITY, 95])
+                    else:
+                        chunk_images.append(np.zeros((256, 256, 3), dtype=np.uint8))
+                        
+                status_label.setText(
+                    f"Processing chunk {chunk_index}/{len(chunk_plan)}: "
+                    f"Writing 1fps keyframe video..."
+                )
+                QApplication.processEvents()
+                
+                video_1fps_filename = f"{prefix}_chunk_{chunk_index:03d}_1fps.mp4"
+                video_1fps_path = os.path.join(chunk_dir, video_1fps_filename)
+                self.write_mp4_file(
+                    video_1fps_path,
+                    reviewed_indices,
+                    quality,
+                    preset,
+                    progress_callback=None,
+                    fps=1,
+                )
+
+                all_images.extend(chunk_images)
+                selection_details.append({
+                    "chunk_index": chunk_index - 1,
+                    "chunk_data": asdict(chunk),
+                    "video_start_frame_abs": abs_start,
+                    "video_end_frame_abs": abs_end,
+                    "selected_frames_abs": reviewed_indices
+                })
+
+            bar.setValue(total_mp4_frames)
+            QApplication.processEvents()
+            
+            status_label.setText("Generating grids and metadata...")
+            QApplication.processEvents()
+            
+            cap = best_dim * best_dim
+            grids = []
+            if all_images:
+                h, w = all_images[0].shape[:2]
+                for i in range(0, len(all_images), cap):
+                    batch = all_images[i:i+cap]
+                    while len(batch) < cap:
+                        batch.append(None)
+                    grids.append(
+                        compose_grid(
+                            batch,
+                            rows=best_dim,
+                            cols=best_dim,
+                            cell_size=(w, h),
+                        )
+                    )
+            
+            saved_grids = []
+            for i, grid in enumerate(grids):
+                if per_chunk_grid:
+                    chunk_dir_name = f"{prefix}_chunk_{i+1:03d}"
+                    grid_filename = f"{prefix}_chunk_{i+1:03d}_grid_{best_dim}x{best_dim}.jpg"
+                    grid_path = os.path.join(output_folder, chunk_dir_name, grid_filename)
+                    saved_grids.append(f"{chunk_dir_name}/{grid_filename}")
+                else:
+                    grid_filename = f"{prefix}_grid_{best_dim}x{best_dim}_{i:03d}.jpg"
+                    grid_path = os.path.join(output_folder, grid_filename)
+                    saved_grids.append(grid_filename)
+                
+                frame_bgr = cv2.cvtColor(grid, cv2.COLOR_RGB2BGR)
+                params = [cv2.IMWRITE_JPEG_QUALITY, 95]
+                cv2.imwrite(grid_path, frame_bgr, params)
+                
+            metadata = {}
+            for detail in selection_details:
+                chunk_num = detail["chunk_index"] + 1
+                start_f = detail["video_start_frame_abs"]
+                metadata[f"chunk {chunk_num}"] = [f - start_f for f in detail["selected_frames_abs"]]
+            
+            metadata.update({
+                "model": "MiniMax H3",
+                "formula": "17k + 5",
+                "start_frame": start_frame,
+                "end_frame": end_frame,
+                "total_frames_processed": total_frames_to_chunk,
+                "chunk_size": chunk_size,
+                "overlap": overlap,
+                "num_chunks": num_chunks,
+                "k_frames_per_chunk": best_k,
+                "grid_dim": best_dim,
+                "output_grids": saved_grids,
+                "chunks": selection_details
+            })
+            
+            with open(os.path.join(output_folder, f"{prefix}_minimax_h3_preparation.json"), "w") as f:
+                json.dump(metadata, f, indent=4)
+
+            QMessageBox.information(
+                self,
+                "Preparation Complete",
+                f"Successfully prepared {num_chunks} MiniMax H3 clip(s) and metadata in {output_folder}",
+            )
+        except Exception as e:
+            QMessageBox.critical(self, "Preparation Error", str(e))
+        finally:
+            progress.close()
 
     def show_grid_splitter_dialog(self):
         default_folder = self.get_default_export_folder()
@@ -2047,6 +2551,84 @@ class MainWindow(QMainWindow):
         data = setup.result_data()
         splitter = SmartGridSplitterDialog(self, data)
         splitter.exec()
+
+    def build_shot_grid_media(self):
+        """Describe the currently loaded clip in a Qt-free form for export."""
+        if self.total_frames <= 0:
+            return None
+
+        source_name = self.get_loaded_source_name()
+        fps = float(self.fps or 24)
+
+        if getattr(self.project, "is_video", False) and getattr(
+            self.project, "video_path", ""
+        ):
+            path = self.project.video_path
+            kind = (
+                "gif"
+                if os.path.splitext(path)[1].lower() == ".gif"
+                else "video"
+            )
+            return ShotGridMedia(
+                source_name=source_name,
+                total_frames=int(self.total_frames),
+                fps=fps,
+                kind=kind,
+                path=path,
+                width=int(getattr(self, "video_width", 0) or 0),
+                height=int(getattr(self, "video_height", 0) or 0),
+            )
+
+        files = []
+        if self.project.sources:
+            files = list(self.project.sources[0].get("files", []) or [])
+        if not files and self.project.folder:
+            from viewer import detect_sequence
+
+            sequences = detect_sequence(self.project.folder)
+            if sequences:
+                files = list(sequences[0]["files"])
+        if not files:
+            return None
+
+        return ShotGridMedia(
+            source_name=source_name,
+            total_frames=int(self.total_frames),
+            fps=fps,
+            kind="sequence",
+            files=tuple(files),
+            width=int(getattr(self, "video_width", 0) or 0),
+            height=int(getattr(self, "video_height", 0) or 0),
+        )
+
+    def show_shot_grid_dialog(self):
+        if self.total_frames == 0:
+            QMessageBox.warning(self, "Shot Grids", "No project loaded.")
+            return
+
+        media = self.build_shot_grid_media()
+        if media is None:
+            QMessageBox.warning(
+                self,
+                "Shot Grids",
+                "Could not find readable frames for the loaded clip.",
+            )
+            return
+
+        dialog = ShotGridDialog(
+            self,
+            media=media,
+            bookmarks=self.bookmarks,
+            settings=self.shot_grid_settings,
+            default_folder=self.get_default_export_folder(),
+        )
+        if dialog.exec() != QDialog.DialogCode.Accepted:
+            return
+
+        result = show_shot_grid_export(self, dialog)
+        if result is not None and result.image_count:
+            if dialog.export_options is not None:
+                self.remember_export_folder(dialog.export_options.output_folder)
 
     def show_gemma_shot_detection_dialog(self):
         if self.total_frames == 0:
@@ -3028,7 +3610,16 @@ Rules:
         return arr[:, : width * 3].reshape((height, width, 3))
 
     def write_mp4_file(
-        self, filepath, frame_numbers, quality, preset="fast", progress_callback=None, fps=None
+        self,
+        filepath,
+        frame_numbers,
+        quality,
+        preset="fast",
+        progress_callback=None,
+        fps=None,
+        include_audio=False,
+        audio_start_frame=None,
+        audio_end_frame=None,
     ):
         import imageio
 
@@ -3041,8 +3632,26 @@ Rules:
 
         effective_fps = fps if fps is not None else self.get_export_fps()
 
+        source_video = (
+            self.project.video_path
+            if getattr(self.project, "is_video", False) and getattr(self.project, "video_path", "")
+            else None
+        )
+        should_mux_audio = bool(
+            include_audio
+            and source_video
+            and os.path.isfile(source_video)
+            and getattr(self, "_has_audio", False)
+        )
+
+        render_path = filepath
+        temp_render_path = None
+        if should_mux_audio:
+            temp_render_path = filepath + ".noaudio.mp4"
+            render_path = temp_render_path
+
         writer = imageio.get_writer(
-            filepath,
+            render_path,
             format="FFMPEG",
             mode="I",
             fps=effective_fps,
@@ -3073,7 +3682,29 @@ Rules:
         finally:
             writer.close()
 
-    def export_mp4(self, filepath, start_frame, end_frame, quality, preset="fast"):
+        if should_mux_audio and temp_render_path:
+            try:
+                a_start = audio_start_frame if audio_start_frame is not None else frame_numbers[0]
+                a_end = audio_end_frame if audio_end_frame is not None else frame_numbers[-1]
+                source_span = max(0, a_end - a_start + 1)
+                pad_frames = max(0, len(frame_numbers) - source_span)
+                mux_audio_into_mp4(
+                    temp_render_path,
+                    source_video,
+                    filepath,
+                    a_start,
+                    a_end,
+                    effective_fps,
+                    pad_frames=pad_frames,
+                )
+            finally:
+                if os.path.exists(temp_render_path):
+                    try:
+                        os.remove(temp_render_path)
+                    except OSError:
+                        pass
+
+    def export_mp4(self, filepath, start_frame, end_frame, quality, preset="fast", include_audio=False):
         if not filepath.endswith(".mp4"):
             filepath += ".mp4"
 
@@ -3093,12 +3724,18 @@ Rules:
                 bar.setValue(start_frame + output_index - 1)
                 QApplication.processEvents()
 
+            write_kwargs = {}
+            if include_audio:
+                write_kwargs["include_audio"] = True
+                write_kwargs["audio_start_frame"] = start_frame
+                write_kwargs["audio_end_frame"] = end_frame
             self.write_mp4_file(
                 filepath,
                 frame_numbers,
                 quality,
                 preset,
                 progress_callback=update_progress,
+                **write_kwargs
             )
 
             bar.setValue(end_frame)
@@ -3116,7 +3753,7 @@ Rules:
 
     def prepare_wan(
         self, output_folder, prefix, chunk_size, overlap, quality, preset,
-        start_frame, end_frame, grid_size, per_chunk_grid=False
+        start_frame, end_frame, grid_size, per_chunk_grid=False, include_audio=False
     ):
         chunk_size = normalize_wan_chunk_size(chunk_size)
         overlap = normalize_chunk_overlap(overlap, chunk_size)
@@ -3268,12 +3905,18 @@ Rules:
                     bar.setValue(base + output_index)
                     QApplication.processEvents()
 
+                write_kwargs = {}
+                if include_audio:
+                    write_kwargs["include_audio"] = True
+                    write_kwargs["audio_start_frame"] = abs_start
+                    write_kwargs["audio_end_frame"] = abs_end
                 self.write_mp4_file(
                     filepath,
                     frame_numbers,
                     quality,
                     preset,
                     progress_callback=update_progress,
+                    **write_kwargs
                 )
 
                 completed_frames += len(frame_numbers)
@@ -3336,16 +3979,15 @@ Rules:
                 for i in range(0, len(all_images), cap):
                     batch = all_images[i:i+cap]
                     while len(batch) < cap:
-                        batch.append(np.zeros((h, w, 3), dtype=np.uint8))
-                    
-                    rows = []
-                    for r in range(best_dim):
-                        row_images = batch[r*best_dim : (r+1)*best_dim]
-                        row_images = [cv2.resize(img, (w, h)) for img in row_images]
-                        rows.append(np.hstack(row_images))
-                        
-                    grid = np.vstack(rows)
-                    grids.append(grid)
+                        batch.append(None)
+                    grids.append(
+                        compose_grid(
+                            batch,
+                            rows=best_dim,
+                            cols=best_dim,
+                            cell_size=(w, h),
+                        )
+                    )
             
             saved_grids = []
             for i, grid in enumerate(grids):
@@ -3408,6 +4050,10 @@ Rules:
             self.audio_scrub = dialog.audio_scrub.isChecked()
             self.scrub_sensitivity = dialog.sensitivity.value()
             self.auto_save_enabled = dialog.auto_save.isChecked()
+            self.audio_enabled = dialog.audio_enabled.isChecked()
+            self.audio_volume = dialog.audio_volume.value()
+            if getattr(self, "_audio_output", None):
+                self._audio_output.setVolume(self.audio_volume / 100.0)
 
             self.save_settings()
             self.fps_label.setText(f"{self.fps} FPS")
@@ -3444,6 +4090,14 @@ Rules:
     def closeEvent(self, event):
         self.play_timer.stop()
         self.auto_save_timer.stop()
+        if getattr(self, "_video_cap", None) is not None:
+            try:
+                self._video_cap.release()
+            except Exception:
+                pass
+            self._video_cap = None
+        if getattr(self, "_audio_player", None) is not None:
+            self._audio_player.stop()
         self.save_settings()
         event.accept()
 
@@ -3480,6 +4134,15 @@ class PreferencesDialog(QDialog):
         self.audio_scrub = QCheckBox()
         self.audio_scrub.setChecked(parent.audio_scrub)
         layout.addRow("Audio Scrub:", self.audio_scrub)
+
+        self.audio_enabled = QCheckBox()
+        self.audio_enabled.setChecked(getattr(parent, "audio_enabled", True))
+        layout.addRow("Enable Audio:", self.audio_enabled)
+
+        self.audio_volume = QSlider(Qt.Orientation.Horizontal)
+        self.audio_volume.setRange(0, 100)
+        self.audio_volume.setValue(getattr(parent, "audio_volume", 80))
+        layout.addRow("Audio Volume:", self.audio_volume)
 
         self.sensitivity = QSlider(Qt.Orientation.Horizontal)
         self.sensitivity.setRange(1, 10)
@@ -3731,7 +4394,20 @@ class ExportBookmarksDialog(QDialog):
         speed_layout = QVBoxLayout()
         speed_layout.addWidget(self.speed_combo)
         speed_layout.addWidget(speed_hint)
-        layout.addRow("Video Speed:", speed_layout)
+        layout.addRow("Speed:", speed_layout)
+
+        self.include_audio_checkbox = QCheckBox("Include Audio")
+        has_audio = getattr(parent, "_has_audio", False)
+        self.include_audio_checkbox.setChecked(has_audio)
+        self.include_audio_checkbox.setEnabled(has_audio)
+        self.audio_hint = QLabel(
+            "Source has audio: ✓" if has_audio else "Source has no audio track."
+        )
+        self.audio_hint.setStyleSheet("color: gray; font-size: 10px;")
+        audio_layout = QVBoxLayout()
+        audio_layout.addWidget(self.include_audio_checkbox)
+        audio_layout.addWidget(self.audio_hint)
+        layout.addRow("Audio:", audio_layout)
 
         buttons = QDialogButtonBox(
             QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel
@@ -3898,6 +4574,19 @@ class ExportBookmarksVideoDialog(QDialog):
         speed_layout.addWidget(speed_hint)
         layout.addRow("Speed:", speed_layout)
 
+        self.include_audio_checkbox = QCheckBox("Include Audio")
+        has_audio = getattr(parent, "_has_audio", False)
+        self.include_audio_checkbox.setChecked(has_audio)
+        self.include_audio_checkbox.setEnabled(has_audio)
+        self.audio_hint = QLabel(
+            "Source has audio: ✓" if has_audio else "Source has no audio track."
+        )
+        self.audio_hint.setStyleSheet("color: gray; font-size: 10px;")
+        audio_layout = QVBoxLayout()
+        audio_layout.addWidget(self.include_audio_checkbox)
+        audio_layout.addWidget(self.audio_hint)
+        layout.addRow("Audio:", audio_layout)
+
         buttons = QDialogButtonBox(
             QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel
         )
@@ -3988,6 +4677,19 @@ class ExportMp4Dialog(QDialog):
         speed_layout.addWidget(self.speed_combo)
         speed_layout.addWidget(speed_hint)
         layout.addRow("Speed:", speed_layout)
+
+        self.include_audio_checkbox = QCheckBox("Include Audio")
+        has_audio = getattr(parent, "_has_audio", False)
+        self.include_audio_checkbox.setChecked(has_audio)
+        self.include_audio_checkbox.setEnabled(has_audio)
+        self.audio_hint = QLabel(
+            "Source has audio: ✓" if has_audio else "Source has no audio track."
+        )
+        self.audio_hint.setStyleSheet("color: gray; font-size: 10px;")
+        audio_layout = QVBoxLayout()
+        audio_layout.addWidget(self.include_audio_checkbox)
+        audio_layout.addWidget(self.audio_hint)
+        layout.addRow("Audio:", audio_layout)
 
         buttons = QDialogButtonBox(
             QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel
@@ -4523,6 +5225,19 @@ class WanPreparationDialog(QDialog):
         padding_hint.setStyleSheet("color: gray; font-size: 10px;")
         layout.addRow(padding_hint)
 
+        self.include_audio_checkbox = QCheckBox("Include Audio")
+        has_audio = getattr(parent, "_has_audio", False)
+        self.include_audio_checkbox.setChecked(has_audio)
+        self.include_audio_checkbox.setEnabled(has_audio)
+        self.audio_hint = QLabel(
+            "Source has audio: ✓" if has_audio else "Source has no audio track."
+        )
+        self.audio_hint.setStyleSheet("color: gray; font-size: 10px;")
+        audio_layout = QVBoxLayout()
+        audio_layout.addWidget(self.include_audio_checkbox)
+        audio_layout.addWidget(self.audio_hint)
+        layout.addRow("Audio:", audio_layout)
+
         buttons = QDialogButtonBox(
             QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel
         )
@@ -4629,4 +5344,229 @@ class WanPreparationDialog(QDialog):
         else:
             desc = "High Quality"
 
+        self.quality_label.setText(f"Quality: {val} ({desc})")
+
+
+class MinimaxPreparationDialog(QDialog):
+    def __init__(self, parent):
+        super().__init__(parent)
+        self.parent_window = parent
+        self.setWindowTitle("MiniMax H3 Preparation")
+        self.setModal(True)
+        self.setMinimumWidth(400)
+
+        layout = QFormLayout(self)
+        self.plan_info = QLabel()
+        self.plan_info.setWordWrap(True)
+        layout.addRow(self.plan_info)
+
+        default_output_folder = parent.get_default_export_folder()
+        self.output_folder = QLineEdit(default_output_folder)
+        folder_layout = QHBoxLayout()
+        folder_layout.addWidget(self.output_folder)
+        browse_btn = QPushButton("...")
+        browse_btn.setFixedWidth(30)
+        browse_btn.clicked.connect(self.browse_output_folder)
+        folder_layout.addWidget(browse_btn)
+        layout.addRow("Output Folder:", folder_layout)
+
+        if getattr(parent.project, "is_video", False) and hasattr(
+            parent.project, "video_path"
+        ):
+            default_name = os.path.splitext(os.path.basename(parent.project.video_path))[0]
+        else:
+            default_name = parent.project.name
+        self.filename_prefix = QLineEdit(sanitize_filename_part(default_name))
+        layout.addRow("Filename Prefix:", self.filename_prefix)
+
+        self.start_spinbox = QSpinBox()
+        self.start_spinbox.setRange(0, parent.total_frames - 1)
+        self.start_spinbox.setValue(0)
+        self.start_spinbox.valueChanged.connect(self.update_chunk_preview)
+        layout.addRow("Start Frame:", self.start_spinbox)
+
+        self.end_spinbox = QSpinBox()
+        self.end_spinbox.setRange(0, parent.total_frames - 1)
+        self.end_spinbox.setValue(parent.total_frames - 1)
+        self.end_spinbox.valueChanged.connect(self.update_chunk_preview)
+        layout.addRow("End Frame:", self.end_spinbox)
+
+        self.grid_combo = QComboBox()
+        self.grid_combo.addItem("Auto (Dynamic)", None)
+        self.grid_combo.addItem("2x2 Grid", "2x2")
+        self.grid_combo.addItem("3x3 Grid", "3x3")
+        layout.addRow("Grid Size:", self.grid_combo)
+
+        self.per_chunk_grid_checkbox = QCheckBox("One grid per chunk")
+        self.per_chunk_grid_checkbox.setChecked(False)
+        layout.addRow("Grid Mode:", self.per_chunk_grid_checkbox)
+
+        self.chunk_size_spinbox = QSpinBox()
+        self.chunk_size_spinbox.setRange(MINIMAX_MIN_FRAMES, 10000)
+        self.chunk_size_spinbox.setValue(MINIMAX_DEFAULT_CHUNK)
+        self.chunk_size_spinbox.valueChanged.connect(self.update_chunk_preview)
+        layout.addRow("Chunk Size:", self.chunk_size_spinbox)
+
+        self.overlap_checkbox = QCheckBox("Enable overlap")
+        self.overlap_checkbox.toggled.connect(self.update_overlap_state)
+        self.overlap_spinbox = QSpinBox()
+        self.overlap_spinbox.setRange(MINIMAX_OVERLAP_MIN, MINIMAX_OVERLAP_MAX)
+        self.overlap_spinbox.setValue(MINIMAX_STRIDE)
+        self.overlap_spinbox.setEnabled(False)
+        self.overlap_spinbox.valueChanged.connect(self.update_chunk_preview)
+
+        overlap_layout = QHBoxLayout()
+        overlap_layout.addWidget(self.overlap_checkbox)
+        overlap_layout.addWidget(self.overlap_spinbox)
+        overlap_layout.addWidget(QLabel("frames"))
+        overlap_layout.addStretch()
+        layout.addRow("Overlap:", overlap_layout)
+
+        self.chunk_label = QLabel()
+        self.chunk_label.setWordWrap(True)
+        layout.addRow("Chunk Rule:", self.chunk_label)
+
+        self.quality_slider = QSlider(Qt.Orientation.Horizontal)
+        self.quality_slider.setRange(1, 10)
+        self.quality_slider.setValue(5)
+        self.quality_slider.setTickPosition(QSlider.TickPosition.TicksBelow)
+        self.quality_slider.setTickInterval(1)
+
+        self.quality_label = QLabel("Quality: 5 (Balanced)")
+        self.quality_slider.valueChanged.connect(self.update_quality_label)
+
+        quality_layout = QVBoxLayout()
+        quality_layout.addWidget(self.quality_label)
+        quality_layout.addWidget(self.quality_slider)
+        layout.addRow("Compression:", quality_layout)
+
+        self.speed_combo = QComboBox()
+        self.speed_combo.addItems(["ultrafast", "fast", "medium", "slow"])
+        self.speed_combo.setCurrentIndex(1)
+        layout.addRow("Speed:", self.speed_combo)
+
+        padding_hint = QLabel(
+            "Short clips are padded by repeating the last frame until they land on a MiniMax H3-safe length (17k + 5)."
+        )
+        padding_hint.setWordWrap(True)
+        padding_hint.setStyleSheet("color: gray; font-size: 10px;")
+        layout.addRow(padding_hint)
+
+        self.include_audio_checkbox = QCheckBox("Include Audio")
+        has_audio = getattr(parent, "_has_audio", False)
+        self.include_audio_checkbox.setChecked(has_audio)
+        self.include_audio_checkbox.setEnabled(has_audio)
+        self.audio_hint = QLabel(
+            "Source has audio: ✓" if has_audio else "Source has no audio track."
+        )
+        self.audio_hint.setStyleSheet("color: gray; font-size: 10px;")
+        audio_layout = QVBoxLayout()
+        audio_layout.addWidget(self.include_audio_checkbox)
+        audio_layout.addWidget(self.audio_hint)
+        layout.addRow("Audio:", audio_layout)
+
+        buttons = QDialogButtonBox(
+            QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel
+        )
+        buttons.accepted.connect(self.accept)
+        buttons.rejected.connect(self.reject)
+        layout.addRow(buttons)
+
+        self.update_chunk_preview()
+
+    def get_chunk_size(self):
+        return normalize_minimax_chunk_size(self.chunk_size_spinbox.value())
+
+    def get_overlap(self):
+        if not self.overlap_checkbox.isChecked():
+            return 0
+        return normalize_minimax_overlap(
+            self.overlap_spinbox.value(), self.get_chunk_size()
+        )
+
+    def browse_output_folder(self):
+        folder = QFileDialog.getExistingDirectory(self, "Select Output Folder")
+        if folder:
+            self.output_folder.setText(folder)
+
+    def update_overlap_state(self, checked=False):
+        self.overlap_spinbox.setEnabled(self.overlap_checkbox.isChecked())
+        self.update_chunk_preview()
+
+    def update_chunk_preview(self, *_args):
+        start_f = self.start_spinbox.value()
+        end_f = self.end_spinbox.value()
+        if start_f > end_f:
+            self.plan_info.setText("Invalid frame range: Start > End")
+            return
+
+        total_span = end_f - start_f + 1
+        requested_chunk_size = self.chunk_size_spinbox.value()
+        snapped_chunk_size = normalize_minimax_chunk_size(requested_chunk_size)
+
+        max_overlap = min(MINIMAX_OVERLAP_MAX, snapped_chunk_size - MINIMAX_MIN_FRAMES)
+        overlap_available = max_overlap >= MINIMAX_OVERLAP_MIN
+
+        self.overlap_checkbox.setEnabled(overlap_available)
+        if overlap_available:
+            self.overlap_spinbox.setRange(MINIMAX_OVERLAP_MIN, max_overlap)
+            if self.overlap_spinbox.value() > max_overlap:
+                self.overlap_spinbox.setValue(max_overlap)
+        else:
+            self.overlap_spinbox.setEnabled(False)
+            if self.overlap_checkbox.isChecked():
+                self.overlap_checkbox.blockSignals(True)
+                self.overlap_checkbox.setChecked(False)
+                self.overlap_checkbox.blockSignals(False)
+
+        overlap = self.get_overlap()
+        self.overlap_spinbox.setEnabled(
+            overlap_available and self.overlap_checkbox.isChecked()
+        )
+        plans = plan_minimax_chunks(total_span, snapped_chunk_size, overlap)
+
+        target_lengths = [str(chunk.target_length) for chunk in plans]
+        target_preview = ", ".join(target_lengths[:6])
+        if len(target_lengths) > 6:
+            target_preview += ", ..."
+
+        raw_lengths = [
+            str(chunk.source_length)
+            if chunk.pad_count == 0
+            else f"{chunk.source_length}->{chunk.target_length}"
+            for chunk in plans
+        ]
+        raw_preview = ", ".join(raw_lengths[:6])
+        if len(raw_lengths) > 6:
+            raw_preview += ", ..."
+
+        self.plan_info.setText(
+            f"{total_span} source frames will export as "
+            f"{len(plans)} MiniMax H3-safe clip(s): {target_preview}"
+        )
+
+        overlap_text = (
+            f"{overlap}-frame overlap between chunks."
+            if overlap
+            else "Overlap off."
+        )
+        tail_padding = plans[-1].pad_count if plans else 0
+        padding_text = (
+            f"Only the final chunk is padded by {tail_padding} frame(s)."
+            if tail_padding
+            else "No trailing padding needed."
+        )
+        self.chunk_label.setText(
+            f"Requested {requested_chunk_size} frames, using {snapped_chunk_size} "
+            f"(nearest MiniMax H3-safe chunk rounded down). {overlap_text}\n"
+            f"Source chunk lengths: {raw_preview}. {padding_text}"
+        )
+
+    def update_quality_label(self, val):
+        if val <= 3:
+            desc = "Small File"
+        elif val <= 6:
+            desc = "Balanced"
+        else:
+            desc = "High Quality"
         self.quality_label.setText(f"Quality: {val} ({desc})")

@@ -474,6 +474,7 @@ File → Export →
   ├── First Frame Image...
   ├── Last Frame Image...
   ├── Bookmarks...
+  ├── Shot Grids...
   ├── MP4...
   ├── Wan Preparation...
   └── Smart Grid Splitter...
@@ -496,6 +497,7 @@ Format is detected from the file extension first, then the file dialog filter, d
 | Single frame | `{source_name}_{label}_f{frame+1:04d}{extension}` |
 | Bookmark image | `{prefix}_bookmark_{index:03d}_f{frame+1:04d}_{bookmark_name}{extension}` |
 | Bookmark video | `{prefix}_bookmarks.mp4` |
+| Shot grid | `{prefix}_shot_{index:03d}_f{start+1:04d}-{end+1:04d}_grid{R}x{C}{_part{p}of{g}}{extension}` |
 
 Characters `< > : " / \ | ? *` in filename parts are replaced with `_`.
 
@@ -561,6 +563,56 @@ Two modes, selected by a dropdown:
 - Resize options: Full / Half / Quarter.
 - Single frame exports the current frame.
 - Sequence export is marked as "coming soon".
+
+### 13.8 Shot Grids Export
+
+**Dialog**: `Export Shot Grids`, modal, minimum 920×780 px.
+
+Each bookmark starts a shot; a shot ends one frame before the next bookmark. The last shot ends at the selected range end. Frames before the first bookmark form an optional lead-in row (unchecked by default).
+
+#### Sampling
+| Field | Values | Default |
+|---|---|---|
+| Every Nth frame | 1–120, plus chips for 2/4/8/12/24 | 4 |
+| Max grid | 3×3, 4×4, 5×5 | 5×5 |
+| Layout | Square, Compact rectangles | Square |
+| Fit | Balanced, Trim, Fill | Balanced |
+| Max spacing change | ×1.00–×2.00 (Balanced only) | ×1.25 |
+
+- **Balanced** keeps the fewest grids that stay within the spacing limit.
+- **Trim** never adds frames; it picks the closest full layout at or below the sample count.
+- **Fill** never drops frames; it picks the fewest grids that hold every sample.
+- Layouts are always completely filled: no black/empty cells. Long shots split into equal grids in time order.
+- Frames stay on the every-Nth lattice when trimming; when filling, they spread evenly across the shot.
+
+#### Shots table
+Live columns: checkbox, shot number, bookmark name, first–last frame (1-based), length, samples at the interval, planned layout (for example `2 × 4×4`) and real spacing. Unchecking a row skips it. Double-clicking seeks the player to the shot start. A summary shows `{shots} shots → {images} images, {empty} empty cell(s)` and flags shots shorter than the interval.
+
+**Range**: Whole clip (default), Custom start/end, or In/Out when both timeline points exist. The table replans when the range or any sampling option changes.
+
+#### Output
+| Field | Values | Default |
+|---|---|---|
+| Output folder | Directory | Default export folder |
+| Filename prefix | Text | Source name |
+| Format | PNG / JPEG / TIFF | PNG |
+| JPEG quality | 80–100 | 95 |
+| Grid size | 1536 / 2048 / 3072 / 4096 px longest side, or Native | 2048 |
+| Gap between cells | 0–64 px | 0 |
+| Burn in frame numbers | Checkbox | Off |
+| Subfolder per shot | Checkbox | Off |
+| Also save individual frames | Checkbox | Off |
+| Write manifest JSON | Checkbox | On |
+| Write Smart Grid Splitter sidecars | Checkbox | On |
+
+Export runs on a worker thread with progress and a Cancel button. Settings persist under the `shot_grid` key in `~/.kfpro_lite_settings.json`. The output folder is `{output}/{prefix}_shot_grids/`; a per-shot subfolder is `shot_{index:03d}/` when enabled. Choosing Native size asks for confirmation when the largest grid would exceed 100 megapixels.
+
+#### Outputs
+- One image per grid part.
+- Optional individual frames as `{prefix}_shot_{index:03d}_f{frame+1:04d}_frame{extension}`.
+- Manifest `{prefix}_shot_grids.json` with source, fps, settings, range, cancellation state and one entry per shot/image (rows, cols, cell size, gap, frame list).
+- Optional sidecar JSON beside each image (`grid_dim`, `grid_rows`, `grid_cols`, `grid_gap`, `cell_width`, `cell_height`, one chunk with absolute selected frames) so Smart Grid Splitter can reopen the grid against the full source video.
+- Missing frames stop only the affected shot, report the frame number, and keep files already written.
 
 ---
 
@@ -730,13 +782,17 @@ Chunk selector shows: `Chunk {index + 1} (frames {start}–{end})`.
 - **Grid overlay**: Drawn on top with configurable opacity and scale.
 - **Cell boundaries**: Dashed yellow lines at cell boundaries.
 
-**Grid position calculation**: For cell `i` (0-indexed, row-major) in an N×N grid:
+**Grid geometry**: sidecars may describe square or rectangular grids, gaps, and cells that are not native video size. The splitter reads `grid_rows`, `grid_cols`, `grid_gap`, `cell_width` and `cell_height`, falling back to legacy `grid_dim` and the grid image dimensions.
+
+**Grid position calculation**: For cell `i` (0-indexed, row-major):
 ```
-col = i % N
-row = i // N
-offset_x = -col × frame_width
-offset_y = -row × frame_height
+col = i % grid_cols
+row = i // grid_cols
+offset_x = -col × (cell_width + gap) × scale
+offset_y = -row × (cell_height + gap) × scale
 ```
+
+The overlay auto-scales so one cell matches the source frame; the scale control remains available for manual correction.
 
 **Manual nudge**: Click-drag shifts the grid. The nudge is stored per-frame and persists when navigating between frames.
 
@@ -746,7 +802,7 @@ offset_y = -row × frame_height
 |---|---|---|
 | Navigation | ◀ Prev / Next ▶ | First frame |
 | Opacity | 0–100% (slider + spinbox) | 50% |
-| Scale | 10–300% (slider + spinbox) | 100% |
+| Scale | 10–1000% (slider + spinbox) | Auto-fit; 100% for legacy native grids |
 | Lock Aspect | Checkbox | On |
 | Reset Position | Button | Resets nudge to (0,0) |
 
@@ -755,7 +811,7 @@ Navigation is limited to only the frames used to build the grid (from JSON metad
 ### 15.5 Export
 
 Clicking "Export Split Images":
-1. For each selected frame, calculate the crop region in the grid image.
+1. For each selected frame, calculate the crop region in the grid image using rows, columns and gaps.
 2. Account for scale and per-frame nudge.
 3. Crop the cell region and resize to original video frame dimensions.
 4. Save as PNG: `{grid_basename}_split_{i:03d}_f{frame_rel:04d}.png`.

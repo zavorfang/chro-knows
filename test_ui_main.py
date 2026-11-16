@@ -142,7 +142,7 @@ class ExportBookmarksDialogTests(unittest.TestCase):
     def test_thumbnail_miniature_no_crop(self):
         timeline = TimelineWidget()
         timeline.set_total_frames(10)
-        timeline.resize(600, 150)
+        self.assertEqual(timeline.height(), 96)
 
         pix = QPixmap(100, 50)
         pix.fill(QColor(255, 0, 0))

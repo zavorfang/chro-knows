@@ -319,13 +319,17 @@ class MainWindow(QMainWindow):
         main_splitter.addWidget(top_splitter)
 
         self.timeline_container = QWidget()
+        self.timeline_container.setSizePolicy(
+            QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed
+        )
         self.timeline_layout = QVBoxLayout(self.timeline_container)
         self.timeline_layout.setContentsMargins(4, 0, 4, 4)
         self.timeline_layout.setSpacing(2)
         main_splitter.addWidget(self.timeline_container)
 
-        main_splitter.setStretchFactor(0, 9)
-        main_splitter.setStretchFactor(1, 1)
+        main_splitter.setCollapsible(1, False)
+        main_splitter.setStretchFactor(0, 1)
+        main_splitter.setStretchFactor(1, 0)
 
         self.main_layout.addWidget(main_splitter)
 
@@ -597,6 +601,7 @@ class MainWindow(QMainWindow):
         self.timeline_scroll.setVerticalScrollBarPolicy(
             Qt.ScrollBarPolicy.ScrollBarAlwaysOff
         )
+        self.timeline_scroll.setFixedHeight(110)
         self.timeline_scroll.setWidget(self.timeline)
         self.timeline_scroll.setStyleSheet(
             "QScrollArea { border: none; background-color: #2a2a2a; }"
@@ -1036,7 +1041,8 @@ class MainWindow(QMainWindow):
             if not cap.isOpened():
                 return
 
-            frame_step = max(1, self.total_frames // 50)
+            # Sample every ~14 frames (every 12th-16th frame), scaling for very long clips
+            frame_step = max(14, self.total_frames // 150)
 
             for i in range(0, self.total_frames, frame_step):
                 cap.set(cv2.CAP_PROP_POS_FRAMES, i)
@@ -1046,11 +1052,11 @@ class MainWindow(QMainWindow):
                     frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
                     h, w = frame_rgb.shape[:2]
 
-                    # Scale to miniature thumbnail with lower quality for fast rendering
-                    thumb_size = 48
-                    scale = thumb_size / max(w, h)
+                    # Scale thumbnail to fill the 62px track height
+                    target_h = 62
+                    scale = target_h / max(h, 1)
                     new_w = max(1, int(w * scale))
-                    new_h = max(1, int(h * scale))
+                    new_h = target_h
 
                     from PIL import Image
                     import numpy as np
@@ -1078,16 +1084,13 @@ class MainWindow(QMainWindow):
 
     def generate_thumbnails(self):
         def worker():
-            for i in range(
-                0, min(self.total_frames, 100), max(1, self.total_frames // 50)
-            ):
+            frame_step = max(14, self.total_frames // 150)
+            for i in range(0, self.total_frames, frame_step):
                 if hasattr(self, "project") and self.project.sources:
                     frame = self.load_frame_data(i)
                     if frame is not None:
-                        thumb = frame.scaled(
-                            48,
-                            48,
-                            Qt.AspectRatioMode.KeepAspectRatio,
+                        thumb = frame.scaledToHeight(
+                            62,
                             Qt.TransformationMode.FastTransformation,
                         )
                         self.timeline.set_thumbnail(i, thumb)

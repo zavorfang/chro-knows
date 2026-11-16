@@ -10,8 +10,7 @@ class TimelineWidget(QWidget):
     
     def __init__(self, parent=None):
         super().__init__(parent)
-        self.setMinimumHeight(120)
-        self.setMaximumHeight(200)
+        self.setFixedHeight(96)
         self.setStyleSheet("background-color: #2a2a2a;")
         self.setMouseTracking(True)
         self.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
@@ -60,7 +59,7 @@ class TimelineWidget(QWidget):
 
     def _bookmark_from_pos(self, pos):
         frame_offset = 50
-        if pos.y() < 0 or pos.y() > 24:
+        if pos.y() < 0 or pos.y() > 18:
             return -1
         hit_radius = max(6, self.frame_width // 2)
         for bookmark_frame in self.bookmarks:
@@ -129,44 +128,58 @@ class TimelineWidget(QWidget):
         
         frame_offset = 50
         
+        top_margin = 14
+        bottom_margin = 20
+        track_h = max(10, self.height() - top_margin - bottom_margin)
+
         visible_rect = event.rect()
         sorted_frames = sorted(self.thumbnails.keys())
         for i, frame in enumerate(sorted_frames):
             x = frame_offset + frame * self.frame_width
             next_frame = sorted_frames[i+1] if i + 1 < len(sorted_frames) else self.total_frames
-            # Calculate width to the next thumbnail, but cap it so the last thumbnail doesn't stretch infinitely if total_frames is very large
-            width = min((next_frame - frame) * self.frame_width, self.thumbnail_size * 5)
+            slot_w = max(1, (next_frame - frame) * self.frame_width)
             
-            if x + width < visible_rect.left() or x > visible_rect.right():
+            if x + slot_w < visible_rect.left() or x > visible_rect.right():
                 continue
 
             thumb = self.thumbnails[frame]
-            target_h = max(10, self.height() - 25)
-            max_w = max(1, int(width))
             
-            # Miniature image scaled down to fit without cropping, using fast transformation for performance
-            thumb_scaled = thumb.scaled(
-                max_w, target_h,
-                Qt.AspectRatioMode.KeepAspectRatio,
-                Qt.TransformationMode.FastTransformation
-            )
+            # Expand thumbnail to fill the full vertical track height (no top/bottom gray gaps)
+            thumb_scaled = thumb.scaledToHeight(track_h, Qt.TransformationMode.FastTransformation)
+            thumb_w = thumb_scaled.width()
             
-            tx = x + (width - thumb_scaled.width()) / 2
-            ty = max(0, (target_h - thumb_scaled.height()) / 2)
-            painter.drawPixmap(int(tx), int(ty), thumb_scaled)
+            draw_w = int(slot_w)
+            painter.save()
+            painter.setClipRect(QRect(int(x), top_margin, draw_w, track_h))
+            
+            if draw_w > thumb_w:
+                scaled_to_slot = thumb.scaled(
+                    draw_w, track_h,
+                    Qt.AspectRatioMode.KeepAspectRatioByExpanding,
+                    Qt.TransformationMode.FastTransformation
+                )
+                painter.drawPixmap(int(x), top_margin, scaled_to_slot)
+            else:
+                painter.drawPixmap(int(x), top_margin, thumb_scaled)
+                
+            painter.restore()
+            
+            # Subtle boundary between thumbnails
+            painter.setPen(QColor(30, 30, 30, 180))
+            painter.drawLine(int(x), top_margin, int(x), top_margin + track_h)
 
         for frame in range(self.total_frames):
             x = frame_offset + frame * self.frame_width
             
             if frame % 10 == 0:
                 painter.setPen(QColor(100, 100, 100))
-                painter.drawLine(x, self.height() - 20, x, self.height() - 10)
+                painter.drawLine(x, self.height() - 18, x, self.height() - 10)
                 
                 painter.setPen(QColor(200, 200, 200))
                 font = painter.font()
                 font.setPointSize(8)
                 painter.setFont(font)
-                painter.drawText(x - 10, self.height() - 5, str(frame + 1))
+                painter.drawText(x - 10, self.height() - 3, str(frame + 1))
         
         if self.in_point is not None:
             ix = frame_offset + self.in_point * self.frame_width
@@ -191,22 +204,22 @@ class TimelineWidget(QWidget):
                 # Ghost at original position (dimmed)
                 painter.setPen(Qt.PenStyle.NoPen)
                 painter.setBrush(QBrush(QColor(255, 107, 53, 80)))
-                painter.drawEllipse(bx - 4, 5, 8, 8)
+                painter.drawEllipse(bx - 4, 3, 8, 8)
                 # Active dot at current drag position
                 drag_x = frame_offset + self._drag_bookmark_current_frame * self.frame_width
                 painter.setPen(QPen(QColor(255, 255, 255), 2))
                 painter.setBrush(QBrush(QColor(255, 107, 53, 200)))
-                painter.drawEllipse(drag_x - 5, 4, 10, 10)
+                painter.drawEllipse(drag_x - 5, 2, 10, 10)
             elif is_selected:
                 # Selected: white highlight ring
                 painter.setPen(QPen(QColor(255, 255, 255), 2))
                 painter.setBrush(QBrush(QColor(255, 107, 53)))
-                painter.drawEllipse(bx - 5, 4, 10, 10)
+                painter.drawEllipse(bx - 5, 2, 10, 10)
             else:
                 # Normal
                 painter.setPen(QColor(255, 107, 53))
                 painter.setBrush(QBrush(QColor(255, 107, 53)))
-                painter.drawEllipse(bx - 4, 5, 8, 8)
+                painter.drawEllipse(bx - 4, 3, 8, 8)
         
         playhead_x = frame_offset + self.playhead * self.frame_width
         painter.setPen(QColor(0, 255, 136))

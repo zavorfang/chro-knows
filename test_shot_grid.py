@@ -86,7 +86,7 @@ class WorkedExampleTests(unittest.TestCase):
         if spacing is None:
             self.assertIsNone(plan.effective_interval)
         else:
-            self.assertAlmostEqual(plan.effective_interval, spacing, places=2)
+            self.assertEqual(round(plan.effective_interval, 2), spacing)
         return plan
 
     def test_worked_examples(self):
@@ -99,15 +99,15 @@ class WorkedExampleTests(unittest.TestCase):
             (4, 65, 1, 4, 4, 4.27),
             (4, 80, 1, 5, 5, 3.29),
             (4, 101, 1, 5, 5, 4.17),
-            (4, 124, 1, 5, 5, 5.00),
-            (4, 128, 2, 4, 4, 4.00),
+            (4, 124, 1, 5, 5, 5.12),
+            (4, 128, 2, 4, 4, 4.10),
             (4, 160, 2, 5, 5, 3.24),
-            (4, 240, 2, 5, 5, 4.82),
-            (4, 300, 3, 5, 5, 4.00),
-            (4, 400, 4, 5, 5, 4.00),
-            (12, 100, 1, 3, 3, 12.00),
+            (4, 240, 2, 5, 5, 4.88),
+            (4, 300, 3, 5, 5, 4.04),
+            (4, 400, 4, 5, 5, 4.03),
+            (12, 100, 1, 3, 3, 12.38),
             (12, 240, 1, 5, 5, 9.96),
-            (12, 400, 2, 4, 4, 12.77),
+            (12, 400, 2, 4, 4, 12.87),
         ]
         for interval, length, parts, rows, cols, spacing in cases:
             with self.subTest(interval=interval, length=length):
@@ -115,11 +115,17 @@ class WorkedExampleTests(unittest.TestCase):
                     interval, length, parts, rows, cols, spacing
                 )
 
-    def test_65_frame_shot_drops_one_lattice_frame(self):
+    def test_15_frame_shot_includes_first_and_last_frame(self):
+        plan = plan_shot(Shot(1, 0, 14), interval=4)
+        self.assertEqual(len(plan.parts), 1)
+        self.assertEqual((plan.parts[0].rows, plan.parts[0].cols), (2, 2))
+        self.assertEqual(plan.all_frames, (0, 5, 9, 14))
+
+    def test_65_frame_shot_spreads_frames_from_start_to_end(self):
         plan = plan_shot(Shot(1, 0, 64), interval=4)
         self.assertEqual(
             plan.all_frames,
-            (0, 4, 8, 12, 16, 20, 24, 28, 36, 40, 44, 48, 52, 56, 60, 64),
+            (0, 4, 9, 13, 17, 21, 26, 30, 34, 38, 43, 47, 51, 55, 60, 64),
         )
 
     def test_50_frame_shot_spreads_padding_evenly(self):
@@ -203,6 +209,11 @@ class InvariantTests(unittest.TestCase):
                                 self.assertEqual(frames, tuple(sorted(frames)))
                                 self.assertTrue(all(0 <= f < length for f in frames))
                                 self.assertLessEqual(plan.total_frames, length)
+                                if plan.total_frames >= 2:
+                                    self.assertEqual(frames[0], 0)
+                                    self.assertEqual(frames[-1], length - 1)
+                                else:
+                                    self.assertEqual(frames, ((length - 1) // 2,))
                                 self.assertLessEqual(max_dim, DEFAULT_MAX_DIM)
                                 self.assertEqual(
                                     len({(p.rows, p.cols) for p in plan.parts}), 1
@@ -244,7 +255,7 @@ class InvariantTests(unittest.TestCase):
             for interval in (1, 2, 3, 4, 6, 8, 12, 24):
                 n = samples_at_interval(length, interval)
                 shot = Shot(1, 0, length - 1)
-                for total in (1, max(1, n - 1), n, min(length, n + 1), length):
+                for total in (1, 2, max(1, n - 1), n, min(length, n + 1), length):
                     if total < 1 or total > length:
                         continue
                     with self.subTest(length=length, interval=interval, total=total):
@@ -252,12 +263,50 @@ class InvariantTests(unittest.TestCase):
                         self.assertEqual(len(frames), total)
                         self.assertEqual(len(set(frames)), total)
                         self.assertEqual(frames, tuple(sorted(frames)))
-                        if total <= n:
-                            for frame in frames:
-                                self.assertEqual((frame - shot.start) % interval, 0)
-                        if total > n and total > 1:
+                        if total == 1:
+                            self.assertEqual(
+                                frames, (shot.start + (length - 1) // 2,)
+                            )
+                        else:
                             self.assertEqual(frames[0], shot.start)
                             self.assertEqual(frames[-1], shot.end)
+                            gaps = [b - a for a, b in zip(frames, frames[1:])]
+                            self.assertLessEqual(max(gaps) - min(gaps), 1)
+
+    def test_multi_frame_plan_starts_and_ends_on_shot_bounds(self):
+        lengths = (*range(1, 70), 124, 128, 240, 300, 400)
+        for start in (0, 25):
+            for length in lengths:
+                shot = Shot(2, start, start + length - 1)
+                for interval in (1, 4, 8, 12):
+                    for rectangular in (False, True):
+                        for strategy in FitStrategy:
+                            with self.subTest(
+                                start=start,
+                                length=length,
+                                interval=interval,
+                                rectangular=rectangular,
+                                strategy=strategy,
+                            ):
+                                plan = plan_shot(
+                                    shot,
+                                    interval=interval,
+                                    rectangular=rectangular,
+                                    strategy=strategy,
+                                )
+                                frames = plan.all_frames
+                                if plan.total_frames >= 2:
+                                    self.assertEqual(frames[0], shot.start)
+                                    self.assertEqual(frames[-1], shot.end)
+                                    self.assertEqual(plan.parts[0].frames[0], shot.start)
+                                    self.assertEqual(plan.parts[-1].frames[-1], shot.end)
+                                    gaps = [b - a for a, b in zip(frames, frames[1:])]
+                                    self.assertLessEqual(max(gaps) - min(gaps), 1)
+                                else:
+                                    self.assertEqual(
+                                        frames,
+                                        (shot.start + (shot.length - 1) // 2,),
+                                    )
 
 
 class BookmarkShotTests(unittest.TestCase):

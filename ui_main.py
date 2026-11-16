@@ -38,6 +38,10 @@ from PyQt6.QtWidgets import (
     QProgressBar,
     QSizePolicy,
     QRadioButton,
+    QTableWidget,
+    QTableWidgetItem,
+    QHeaderView,
+    QAbstractItemView,
 )
 from PyQt6.QtCore import Qt, QTimer, pyqtSignal, QSize, QPointF, QRectF, QEvent, QUrl
 from PyQt6.QtMultimedia import QMediaPlayer, QAudioOutput
@@ -88,6 +92,7 @@ from app_utils import (
 
     IMAGE_EXPORT_FILTER,
     IMAGE_EXPORT_FORMATS,
+    build_bookmark_data_export_filename,
     build_bookmark_export_filename,
     build_bookmark_video_export_filename,
     build_frame_export_filename,
@@ -97,6 +102,17 @@ from app_utils import (
     normalize_recent_files,
     push_recent_file,
     sanitize_filename_part,
+)
+from bookmark_io import (
+    BOOKMARK_IMPORT_FILTER,
+    CollisionPolicy,
+    OutOfRangePolicy,
+    PositionMode,
+    StartAnchorMode,
+    export_bookmarks_file,
+    load_bookmarks_file,
+    plan_bookmark_import,
+    recommend_position_mode,
 )
 from gemma_shot_detection import (
     AnalysisChunk,
@@ -273,6 +289,26 @@ class MainWindow(QMainWindow):
         self.clear_bookmarks_btn.clicked.connect(self.delete_all_bookmarks)
         bookmark_button_row.addWidget(self.clear_bookmarks_btn)
 
+        self.import_bookmarks_btn = QPushButton("📥")
+        self.import_bookmarks_btn.setFixedSize(28, 28)
+        self.import_bookmarks_btn.setStyleSheet("font-size: 12px; padding: 0;")
+        self.import_bookmarks_btn.setToolTip(
+            "Import bookmark locations/timestamps (CSV / JSON)..."
+        )
+        self.import_bookmarks_btn.clicked.connect(self.show_import_bookmarks_dialog)
+        bookmark_button_row.addWidget(self.import_bookmarks_btn)
+
+        self.export_bookmark_data_btn = QPushButton("📤")
+        self.export_bookmark_data_btn.setFixedSize(28, 28)
+        self.export_bookmark_data_btn.setStyleSheet("font-size: 12px; padding: 0;")
+        self.export_bookmark_data_btn.setToolTip(
+            "Export bookmark locations/timestamps (CSV / JSON)..."
+        )
+        self.export_bookmark_data_btn.clicked.connect(
+            self.show_export_bookmark_data_dialog
+        )
+        bookmark_button_row.addWidget(self.export_bookmark_data_btn)
+
         bookmark_button_row.addStretch()
         right_layout.addLayout(bookmark_button_row)
 
@@ -419,6 +455,10 @@ class MainWindow(QMainWindow):
         load_action.triggered.connect(self.load_project)
         file_menu.addAction(load_action)
 
+        import_bookmarks_action = QAction("Import Bookmarks...", self)
+        import_bookmarks_action.triggered.connect(self.show_import_bookmarks_dialog)
+        file_menu.addAction(import_bookmarks_action)
+
         file_menu.addSeparator()
 
         export_menu = file_menu.addMenu("Export")
@@ -443,6 +483,14 @@ class MainWindow(QMainWindow):
         export_bookmarks_action = QAction("Bookmarks...", self)
         export_bookmarks_action.triggered.connect(self.show_export_bookmarks_dialog)
         export_menu.addAction(export_bookmarks_action)
+
+        export_bookmark_data_action = QAction(
+            "Bookmark Locations (CSV / JSON)...", self
+        )
+        export_bookmark_data_action.triggered.connect(
+            self.show_export_bookmark_data_dialog
+        )
+        export_menu.addAction(export_bookmark_data_action)
 
         self.export_shot_grids_action = QAction("Shot Grids...", self)
         self.export_shot_grids_action.triggered.connect(self.show_shot_grid_dialog)
@@ -565,7 +613,7 @@ class MainWindow(QMainWindow):
         scrollbar = self.timeline_scroll.horizontalScrollBar()
         viewport_width = self.timeline_scroll.viewport().width()
         current_scroll = scrollbar.value()
-        margin = 100
+        margin = min(100, max(20, viewport_width // 4)) if viewport_width > 40 else 10
 
         if playhead_x < current_scroll + margin:
             scrollbar.setValue(int(max(0, playhead_x - margin)))
@@ -998,16 +1046,17 @@ class MainWindow(QMainWindow):
                     frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
                     h, w = frame_rgb.shape[:2]
 
-                    # Scale to thumbnail
-                    scale = 64 / max(w, h)
-                    new_w = int(w * scale)
-                    new_h = int(h * scale)
+                    # Scale to miniature thumbnail with lower quality for fast rendering
+                    thumb_size = 48
+                    scale = thumb_size / max(w, h)
+                    new_w = max(1, int(w * scale))
+                    new_h = max(1, int(h * scale))
 
                     from PIL import Image
                     import numpy as np
 
                     img = Image.fromarray(frame_rgb)
-                    img = img.resize((new_w, new_h), Image.Resampling.LANCZOS)
+                    img = img.resize((new_w, new_h), Image.Resampling.BILINEAR)
 
                     thumb = QPixmap.fromImage(
                         QImage(
@@ -1036,10 +1085,10 @@ class MainWindow(QMainWindow):
                     frame = self.load_frame_data(i)
                     if frame is not None:
                         thumb = frame.scaled(
-                            64,
-                            64,
+                            48,
+                            48,
                             Qt.AspectRatioMode.KeepAspectRatio,
-                            Qt.TransformationMode.SmoothTransformation,
+                            Qt.TransformationMode.FastTransformation,
                         )
                         self.timeline.set_thumbnail(i, thumb)
 
@@ -1179,6 +1228,8 @@ class MainWindow(QMainWindow):
         self.current_frame = frame_num
         self.load_frame(frame_num)
         self.update_frame_display()
+        self.timeline.set_playhead(frame_num)
+        self.overview_timeline.set_playhead(frame_num)
         self.sync_timeline_scroll()
         self.update_bookmark_button_state()
         if self.is_playing:
@@ -1260,6 +1311,7 @@ class MainWindow(QMainWindow):
             self.update_frame_display()
             self.timeline.set_playhead(self.current_frame)
             self.overview_timeline.set_playhead(self.current_frame)
+            self.sync_timeline_scroll()
             self.update_bookmark_button_state()
             if self.is_playing:
                 self._play_clock_start = time.perf_counter()
@@ -1276,6 +1328,7 @@ class MainWindow(QMainWindow):
             self.update_frame_display()
             self.timeline.set_playhead(self.current_frame)
             self.overview_timeline.set_playhead(self.current_frame)
+            self.sync_timeline_scroll()
             self.update_bookmark_button_state()
             if self.is_playing:
                 self._play_clock_start = time.perf_counter()
@@ -1291,6 +1344,7 @@ class MainWindow(QMainWindow):
         self.update_frame_display()
         self.timeline.set_playhead(0)
         self.overview_timeline.set_playhead(0)
+        self.sync_timeline_scroll()
         self.update_bookmark_button_state()
         if self.is_playing:
             self._play_clock_start = time.perf_counter()
@@ -1304,6 +1358,7 @@ class MainWindow(QMainWindow):
         self.update_frame_display()
         self.timeline.set_playhead(self.current_frame)
         self.overview_timeline.set_playhead(self.current_frame)
+        self.sync_timeline_scroll()
         self.update_bookmark_button_state()
         if self.is_playing:
             self._play_clock_start = time.perf_counter()
@@ -1377,6 +1432,20 @@ class MainWindow(QMainWindow):
         export_bookmarks_action.triggered.connect(self.show_export_bookmarks_dialog)
         export_bookmarks_action.setEnabled(bool(self.bookmarks))
         menu.addAction(export_bookmarks_action)
+
+        export_bookmark_data_action = QAction(
+            "Export Bookmark Locations (CSV / JSON)...", self
+        )
+        export_bookmark_data_action.triggered.connect(
+            self.show_export_bookmark_data_dialog
+        )
+        export_bookmark_data_action.setEnabled(bool(self.bookmarks))
+        menu.addAction(export_bookmark_data_action)
+
+        import_bookmarks_action = QAction("Import Bookmarks...", self)
+        import_bookmarks_action.triggered.connect(self.show_import_bookmarks_dialog)
+        import_bookmarks_action.setEnabled(self.total_frames > 0)
+        menu.addAction(import_bookmarks_action)
 
         menu.exec(self.viewer.mapToGlobal(position))
 
@@ -1461,6 +1530,18 @@ class MainWindow(QMainWindow):
         if dialog.exec() != QDialog.DialogCode.Accepted:
             return
 
+        if dialog.is_data_mode():
+            output_path = dialog.output_path.text().strip()
+            if not output_path:
+                QMessageBox.warning(self, "Export", "Please choose an output file.")
+                return
+
+            fmt = dialog.get_data_format()
+            self.export_bookmarks_data(
+                ensure_extension(output_path, f".{fmt}"), format_name=fmt
+            )
+            return
+
         if dialog.is_video_mode():
             output_path = dialog.output_path.text().strip()
             if not output_path:
@@ -1486,6 +1567,166 @@ class MainWindow(QMainWindow):
             dialog.filename_prefix.text().strip(),
             dialog.get_format_name(),
             jpeg_quality=dialog.jpeg_quality.value(),
+        )
+
+    def show_export_bookmark_data_dialog(self):
+        if not self.bookmarks:
+            QMessageBox.warning(self, "Export", "No bookmarks available to export.")
+            return
+
+        default_name = build_bookmark_data_export_filename(
+            self.get_loaded_source_name(), ".json"
+        )
+        default_path = os.path.join(self.get_default_export_folder(), default_name)
+        filepath, selected_filter = QFileDialog.getSaveFileName(
+            self,
+            "Export Bookmark Locations (CSV / JSON)",
+            default_path,
+            "JSON Files (*.json);;CSV Files (*.csv)",
+        )
+        if not filepath:
+            return
+
+        ext = os.path.splitext(filepath)[1].lower()
+        if ext == ".csv" or (ext != ".json" and "CSV" in (selected_filter or "").upper()):
+            fmt = "csv"
+        else:
+            fmt = "json"
+        filepath = ensure_extension(filepath, f".{fmt}")
+
+        try:
+            self.export_bookmarks_data(filepath, format_name=fmt)
+        except Exception as e:
+            QMessageBox.critical(self, "Export Error", str(e))
+
+    def export_bookmarks_data(self, filepath, format_name=None):
+        if not self.bookmarks:
+            raise ValueError("No bookmarks available to export.")
+
+        fps = self.get_effective_fps()
+        saved_path = export_bookmarks_file(
+            filepath,
+            self.bookmarks,
+            fps=fps,
+            format_name=format_name,
+            source_name=self.get_loaded_source_name(),
+            total_frames=self.total_frames,
+        )
+        self.remember_export_folder(saved_path)
+        self.statusBar().showMessage(
+            f"Exported {len(self.bookmarks)} bookmark(s) to {os.path.basename(saved_path)}.",
+            4000,
+        )
+        QMessageBox.information(
+            self,
+            "Export Complete",
+            f"Exported {len(self.bookmarks)} bookmark location(s) at {fps:g} fps to:\n{saved_path}",
+        )
+        return saved_path
+
+    def apply_bookmark_import_plan(self, plan):
+        self.bookmarks = list(plan.final_bookmarks)
+        valid_frames = {bm["frame"] for bm in self.bookmarks}
+
+        for tl in (
+            getattr(self, "timeline", None),
+            getattr(self, "overview_timeline", None),
+        ):
+            if tl is None:
+                continue
+            tl.bookmarks.clear()
+            for bm in self.bookmarks:
+                tl.bookmarks.add(bm["frame"])
+            if tl.selected_bookmark not in valid_frames:
+                tl.selected_bookmark = -1
+            tl.update()
+
+        self.update_bookmark_list()
+        self.update_bookmark_button_state()
+
+    def import_bookmarks_from_file(
+        self,
+        filepath,
+        position_mode=None,
+        out_of_range=OutOfRangePolicy.SKIP,
+        collision_policy=CollisionPolicy.KEEP_EXISTING,
+        start_frame=None,
+        start_anchor=StartAnchorMode.FIRST_BOOKMARK,
+    ):
+        if self.total_frames <= 0:
+            raise ValueError("Load a video or image sequence before importing bookmarks.")
+
+        document = load_bookmarks_file(filepath)
+        target_fps = self.get_effective_fps()
+        resolved_mode = (
+            position_mode
+            if position_mode is not None
+            else recommend_position_mode(document, target_fps)
+        )
+        plan = plan_bookmark_import(
+            document,
+            existing_bookmarks=self.bookmarks,
+            target_total_frames=self.total_frames,
+            target_fps=target_fps,
+            position_mode=resolved_mode,
+            out_of_range=out_of_range,
+            collision_policy=collision_policy,
+            start_frame=start_frame,
+            start_anchor=start_anchor,
+        )
+        self.apply_bookmark_import_plan(plan)
+        return plan
+
+    def show_import_bookmarks_dialog(self):
+        if self.total_frames <= 0:
+            QMessageBox.warning(
+                self,
+                "Import Bookmarks",
+                "Load a video or image sequence before importing bookmarks.",
+            )
+            return
+
+        filepath, _ = QFileDialog.getOpenFileName(
+            self,
+            "Import Bookmarks",
+            self.get_default_export_folder(),
+            BOOKMARK_IMPORT_FILTER,
+        )
+        if not filepath:
+            return
+
+        try:
+            document = load_bookmarks_file(filepath)
+        except Exception as e:
+            QMessageBox.critical(self, "Import Error", str(e))
+            return
+
+        if not document.bookmarks:
+            QMessageBox.warning(
+                self,
+                "Import Bookmarks",
+                "No bookmarks were found in the selected file.",
+            )
+            return
+
+        dialog = ImportBookmarksDialog(self, filepath, document=document)
+        if dialog.exec() != QDialog.DialogCode.Accepted or dialog.plan is None:
+            return
+
+        plan = dialog.plan
+        self.apply_bookmark_import_plan(plan)
+        applied = plan.imported_count + plan.overwritten_count
+        self.statusBar().showMessage(
+            f"Imported {applied} bookmark(s) ({plan.skipped_count} skipped).",
+            4000,
+        )
+        QMessageBox.information(
+            self,
+            "Import Complete",
+            f"Added: {plan.imported_count}\n"
+            f"Overwritten: {plan.overwritten_count}\n"
+            f"Clamped to end: {plan.clamped_count}\n"
+            f"Skipped: {plan.skipped_count}",
         )
 
     def show_export_bookmarks_video_dialog(self):
@@ -1799,6 +2040,8 @@ class MainWindow(QMainWindow):
             self.remove_bookmark_btn.setEnabled(has_bookmark)
         if hasattr(self, "clear_bookmarks_btn"):
             self.clear_bookmarks_btn.setEnabled(bool(self.bookmarks))
+        if hasattr(self, "export_bookmark_data_btn"):
+            self.export_bookmark_data_btn.setEnabled(bool(self.bookmarks))
 
     def remove_current_bookmark(self):
         """Remove the bookmark at the current frame."""
@@ -1982,8 +2225,8 @@ class MainWindow(QMainWindow):
 
     def show_bookmark_context_menu(self, position):
         item = self.bookmark_list.itemAt(position)
+        menu = QMenu(self)
         if item:
-            menu = QMenu()
             export_action = QAction("Export Bookmark Image...", self)
             export_action.triggered.connect(
                 lambda: self.export_selected_bookmark_image(item)
@@ -1995,6 +2238,18 @@ class MainWindow(QMainWindow):
             export_all_action.setEnabled(bool(self.bookmarks))
             menu.addAction(export_all_action)
 
+            export_data_action = QAction(
+                "Export Bookmark Locations (CSV / JSON)...", self
+            )
+            export_data_action.triggered.connect(self.show_export_bookmark_data_dialog)
+            export_data_action.setEnabled(bool(self.bookmarks))
+            menu.addAction(export_data_action)
+
+            import_action = QAction("Import Bookmarks...", self)
+            import_action.triggered.connect(self.show_import_bookmarks_dialog)
+            import_action.setEnabled(self.total_frames > 0)
+            menu.addAction(import_action)
+
             menu.addSeparator()
             clear_action = QAction("Delete All Bookmarks", self)
             clear_action.triggered.connect(self.delete_all_bookmarks)
@@ -2005,7 +2260,25 @@ class MainWindow(QMainWindow):
             delete_action = QAction("Delete Bookmark", self)
             delete_action.triggered.connect(lambda: self.delete_bookmark(item))
             menu.addAction(delete_action)
-            menu.exec(self.bookmark_list.mapToGlobal(position))
+        else:
+            import_action = QAction("Import Bookmarks...", self)
+            import_action.triggered.connect(self.show_import_bookmarks_dialog)
+            import_action.setEnabled(self.total_frames > 0)
+            menu.addAction(import_action)
+
+            export_data_action = QAction(
+                "Export Bookmark Locations (CSV / JSON)...", self
+            )
+            export_data_action.triggered.connect(self.show_export_bookmark_data_dialog)
+            export_data_action.setEnabled(bool(self.bookmarks))
+            menu.addAction(export_data_action)
+
+            export_all_action = QAction("Export Bookmarks...", self)
+            export_all_action.triggered.connect(self.show_export_bookmarks_dialog)
+            export_all_action.setEnabled(bool(self.bookmarks))
+            menu.addAction(export_all_action)
+
+        menu.exec(self.bookmark_list.mapToGlobal(position))
 
     def delete_bookmark_by_frame(self, frame):
         if self.get_bookmark_for_frame(frame) is None:
@@ -2972,6 +3245,30 @@ class MainWindow(QMainWindow):
             f"Google kept returning a temporary server error.\n\nLast error: {last_exc}"
         ) from last_exc
 
+    def _call_generate_content_with_fallback(
+        self, client, types, model_name, contents, system_instruction
+    ):
+        try:
+            return client.models.generate_content(
+                model=model_name,
+                contents=contents,
+                config=types.GenerateContentConfig(
+                    system_instruction=system_instruction,
+                    thinking_config=types.ThinkingConfig(thinking_level="high"),
+                ),
+            )
+        except Exception as exc:
+            msg = str(exc).lower()
+            if "thinking" in msg or "invalid" in msg or "unsupported" in msg:
+                return client.models.generate_content(
+                    model=model_name,
+                    contents=contents,
+                    config=types.GenerateContentConfig(
+                        system_instruction=system_instruction,
+                    ),
+                )
+            raise
+
     def analyze_chunk_with_gemma(
         self,
         client,
@@ -3033,13 +3330,8 @@ Rules:
         if status_callback:
             status_callback(f"Gemma is analyzing chunk {chunk.index + 1}...")
         response = self.run_gemma_with_retry(
-            lambda: client.models.generate_content(
-                model=model_name,
-                contents=[prompt, uploaded_file],
-                config=types.GenerateContentConfig(
-                    system_instruction=system_prompt,
-                    thinking_config=types.ThinkingConfig(thinking_level="high"),
-                ),
+            lambda: self._call_generate_content_with_fallback(
+                client, types, model_name, [prompt, uploaded_file], system_prompt
             ),
             f"Analyzing chunk {chunk.index + 1}",
             status_callback=status_callback,
@@ -3171,13 +3463,12 @@ Rules:
 """.strip()
 
         response = self.run_gemma_with_retry(
-            lambda: client.models.generate_content(
-                model=model_name,
-                contents=[prompt, contact_sheet],
-                config=types.GenerateContentConfig(
-                    system_instruction="You are a strict JSON vision validator.",
-                    thinking_config=types.ThinkingConfig(thinking_level="high"),
-                ),
+            lambda: self._call_generate_content_with_fallback(
+                client,
+                types,
+                model_name,
+                [prompt, contact_sheet],
+                "You are a strict JSON vision validator.",
             ),
             "Validating hard-cut candidates",
             status_callback=status_callback,
@@ -3583,14 +3874,27 @@ Rules:
         finally:
             progress.close()
 
+    def get_effective_fps(self):
+        if getattr(self.project, "is_video", False) and hasattr(
+            self.project, "video_fps"
+        ):
+            try:
+                video_fps = float(self.project.video_fps)
+                if video_fps > 0:
+                    return video_fps
+            except (TypeError, ValueError):
+                pass
+        try:
+            fps = float(self.fps)
+            if fps > 0:
+                return fps
+        except (TypeError, ValueError):
+            pass
+        return 24.0
+
     def get_export_fps(self):
-        fps = (
-            self.project.video_fps
-            if getattr(self.project, "is_video", False)
-            and hasattr(self.project, "video_fps")
-            else self.fps
-        )
-        return int(fps) if fps > 0 else 24
+        fps = int(self.get_effective_fps())
+        return fps if fps > 0 else 24
 
     def quality_to_crf(self, quality):
         return int(35 - ((quality - 1) * (20 / 9)))
@@ -4289,7 +4593,8 @@ class ExportBookmarksDialog(QDialog):
         layout = QFormLayout(self)
 
         info = QLabel(
-            f"{len(parent.bookmarks)} bookmark(s) can export as an image sequence or a stitched video."
+            f"{len(parent.bookmarks)} bookmark(s) can export as an image sequence, "
+            "a stitched video, or a JSON/CSV location file."
         )
         info.setWordWrap(True)
         layout.addRow(info)
@@ -4297,6 +4602,8 @@ class ExportBookmarksDialog(QDialog):
         self.mode_combo = QComboBox()
         self.mode_combo.addItem("Image Sequence", "images")
         self.mode_combo.addItem("Video", "video")
+        self.mode_combo.addItem("JSON (Locations & Timestamps)", "json")
+        self.mode_combo.addItem("CSV (Locations & Timestamps)", "csv")
         self.mode_combo.currentIndexChanged.connect(self.update_mode_state)
         layout.addRow("Export Type:", self.mode_combo)
 
@@ -4427,20 +4734,36 @@ class ExportBookmarksDialog(QDialog):
             self.output_folder.setText(folder)
 
     def browse_output_path(self):
+        mode = self.mode_combo.currentData() or "video"
+        filter_map = {
+            "video": ("Export Bookmarks as Video", "MP4 Video (*.mp4)", ".mp4"),
+            "json": ("Export Bookmarks as JSON", "JSON Files (*.json)", ".json"),
+            "csv": ("Export Bookmarks as CSV", "CSV Files (*.csv)", ".csv"),
+        }
+        title, file_filter, ext = filter_map.get(
+            mode, ("Export Bookmarks", "All Files (*)", "")
+        )
         filepath, _ = QFileDialog.getSaveFileName(
             self,
-            "Export Bookmarks as Video",
+            title,
             self.output_path.text().strip(),
-            "MP4 Video (*.mp4)",
+            file_filter,
         )
         if filepath:
-            self.output_path.setText(ensure_extension(filepath, ".mp4"))
+            self.output_path.setText(ensure_extension(filepath, ext) if ext else filepath)
 
     def get_format_name(self):
         return self.format_combo.currentText()
 
     def is_video_mode(self):
         return self.mode_combo.currentData() == "video"
+
+    def is_data_mode(self):
+        return self.mode_combo.currentData() in {"json", "csv"}
+
+    def get_data_format(self):
+        mode = self.mode_combo.currentData()
+        return mode if mode in {"json", "csv"} else "json"
 
     def update_quality_label(self, value):
         self.jpeg_quality_label.setText(f"JPEG Quality: {value}")
@@ -4470,7 +4793,16 @@ class ExportBookmarksDialog(QDialog):
         self.quality_label.setText(f"Quality: {val} ({desc})")
 
     def update_mode_state(self):
-        image_mode = not self.is_video_mode()
+        mode = self.mode_combo.currentData() or "images"
+        image_mode = mode == "images"
+        video_mode = mode == "video"
+        file_output_mode = mode in {"video", "json", "csv"}
+
+        ext_map = {"video": ".mp4", "json": ".json", "csv": ".csv"}
+        if mode in ext_map:
+            current_path = self.output_path.text().strip()
+            if current_path:
+                self.output_path.setText(ensure_extension(current_path, ext_map[mode]))
 
         self.output_folder.setEnabled(image_mode)
         self.browse_output_folder_btn.setEnabled(image_mode)
@@ -4481,12 +4813,324 @@ class ExportBookmarksDialog(QDialog):
             self.jpeg_quality.setEnabled(False)
             self.jpeg_quality_label.setEnabled(False)
 
-        self.output_path.setEnabled(not image_mode)
-        self.browse_output_path_btn.setEnabled(not image_mode)
-        self.hold_spinbox.setEnabled(not image_mode)
-        self.fps_spinbox.setEnabled(not image_mode)
-        self.quality_slider.setEnabled(not image_mode)
-        self.speed_combo.setEnabled(not image_mode)
+        self.output_path.setEnabled(file_output_mode)
+        self.browse_output_path_btn.setEnabled(file_output_mode)
+        self.hold_spinbox.setEnabled(video_mode)
+        self.fps_spinbox.setEnabled(video_mode)
+        self.quality_slider.setEnabled(video_mode)
+        self.speed_combo.setEnabled(video_mode)
+        if hasattr(self, "include_audio_checkbox"):
+            self.include_audio_checkbox.setEnabled(
+                video_mode and getattr(self.parent_window, "_has_audio", False)
+            )
+
+
+class ImportBookmarksDialog(QDialog):
+    """Preview and configure cross-clip bookmark import from CSV/JSON."""
+
+    _STATUS_DISPLAY = {
+        "import": ("Import", "#4EC9B0"),
+        "overwrite": ("Overwrite", "#e5c07b"),
+        "clamped": ("Clamped", "#ff6b35"),
+        "skip_existing": ("Skip (exists)", "#888888"),
+        "skip_duplicate": ("Skip (duplicate)", "#888888"),
+        "skip_out_of_range": ("Skip (out of range)", "#888888"),
+        "skip_unresolvable": ("Skip (no position)", "#888888"),
+    }
+
+    def __init__(self, parent, filepath, document=None):
+        super().__init__(parent)
+        self.parent_window = parent
+        self.filepath = filepath
+        self.document = document if document is not None else load_bookmarks_file(filepath)
+        self.plan = None
+
+        self.setWindowTitle("Import Bookmarks")
+        self.setModal(True)
+        self.setMinimumSize(680, 480)
+
+        layout = QVBoxLayout(self)
+
+        form = QFormLayout()
+
+        self.filepath_edit = QLineEdit(filepath)
+        self.filepath_edit.setReadOnly(True)
+        browse_btn = QPushButton("Browse...")
+        browse_btn.clicked.connect(self._browse_file)
+        file_row = QHBoxLayout()
+        file_row.addWidget(self.filepath_edit)
+        file_row.addWidget(browse_btn)
+        form.addRow("Bookmark File:", file_row)
+
+        self.source_info_label = QLabel()
+        self.source_info_label.setWordWrap(True)
+        form.addRow("Source Info:", self.source_info_label)
+
+        self.target_info_label = QLabel()
+        self.target_info_label.setWordWrap(True)
+        form.addRow("Target Clip:", self.target_info_label)
+
+        self.position_mode_combo = QComboBox()
+        self.position_mode_combo.addItem(
+            "Timestamp (preserve timing across FPS)", PositionMode.TIMESTAMP
+        )
+        self.position_mode_combo.addItem(
+            "Frame Number (0-based index)", PositionMode.FRAME
+        )
+        self.position_mode_combo.currentIndexChanged.connect(self.replan_preview)
+        form.addRow("Map Position By:", self.position_mode_combo)
+
+        self.start_anchor_combo = QComboBox()
+        self.start_anchor_combo.addItem(
+            "Original positions (no shift)", StartAnchorMode.ORIGINAL
+        )
+        self.start_anchor_combo.addItem(
+            "Start first bookmark at frame", StartAnchorMode.FIRST_BOOKMARK
+        )
+        self.start_anchor_combo.addItem(
+            "Offset clip start (frame 1) to frame", StartAnchorMode.CLIP_START
+        )
+        self.start_anchor_combo.currentIndexChanged.connect(
+            self._on_start_anchor_changed
+        )
+
+        total_frames = max(1, self._target_total_frames())
+        current_1based = self._current_frame_1based()
+        self.start_frame_spin = QSpinBox()
+        self.start_frame_spin.setRange(1, total_frames)
+        self.start_frame_spin.setValue(current_1based)
+        self.start_frame_spin.setPrefix("Frame ")
+        self.start_frame_spin.setEnabled(False)
+        self.start_frame_spin.valueChanged.connect(self.replan_preview)
+
+        self.use_current_frame_btn = QPushButton(f"Current ({current_1based})")
+        self.use_current_frame_btn.setToolTip(
+            "Start the imported bookmarks at the current playhead frame"
+        )
+        self.use_current_frame_btn.clicked.connect(self._use_current_frame_for_start)
+
+        start_row = QHBoxLayout()
+        start_row.addWidget(self.start_anchor_combo, stretch=1)
+        start_row.addWidget(self.start_frame_spin)
+        start_row.addWidget(self.use_current_frame_btn)
+        form.addRow("Start At Frame:", start_row)
+
+        self.out_of_range_combo = QComboBox()
+        self.out_of_range_combo.addItem(
+            "Skip out-of-range bookmarks", OutOfRangePolicy.SKIP
+        )
+        self.out_of_range_combo.addItem(
+            "Clamp to last frame of clip", OutOfRangePolicy.CLAMP
+        )
+        self.out_of_range_combo.currentIndexChanged.connect(self.replan_preview)
+        form.addRow("Out-of-Range:", self.out_of_range_combo)
+
+        self.collision_combo = QComboBox()
+        self.collision_combo.addItem(
+            "Keep existing on collision", CollisionPolicy.KEEP_EXISTING
+        )
+        self.collision_combo.addItem(
+            "Overwrite existing on collision", CollisionPolicy.OVERWRITE
+        )
+        self.collision_combo.addItem(
+            "Clear all existing bookmarks first", CollisionPolicy.REPLACE_ALL
+        )
+        self.collision_combo.currentIndexChanged.connect(self.replan_preview)
+        form.addRow("Existing Bookmarks:", self.collision_combo)
+
+        layout.addLayout(form)
+
+        self.preview_table = QTableWidget(0, 5)
+        self.preview_table.setHorizontalHeaderLabels(
+            ["Name", "Source Frame", "Source Time", "Target Frame", "Status"]
+        )
+        self.preview_table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
+        self.preview_table.setSelectionBehavior(
+            QAbstractItemView.SelectionBehavior.SelectRows
+        )
+        self.preview_table.setSelectionMode(
+            QAbstractItemView.SelectionMode.SingleSelection
+        )
+        self.preview_table.setAlternatingRowColors(True)
+        self.preview_table.verticalHeader().setVisible(False)
+        header = self.preview_table.horizontalHeader()
+        header.setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)
+        for col in range(1, 5):
+            header.setSectionResizeMode(col, QHeaderView.ResizeMode.ResizeToContents)
+        layout.addWidget(self.preview_table, stretch=1)
+
+        self.summary_label = QLabel()
+        self.summary_label.setWordWrap(True)
+        layout.addWidget(self.summary_label)
+
+        self.buttons = QDialogButtonBox(
+            QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel
+        )
+        self.import_button = self.buttons.button(QDialogButtonBox.StandardButton.Ok)
+        self.import_button.setText("Import")
+        self.buttons.accepted.connect(self.accept)
+        self.buttons.rejected.connect(self.reject)
+        layout.addWidget(self.buttons)
+
+        self._sync_document_metadata()
+        self.replan_preview()
+
+    def _target_total_frames(self) -> int:
+        return int(getattr(self.parent_window, "total_frames", 0) or 0)
+
+    def _current_frame_1based(self) -> int:
+        total = max(1, self._target_total_frames())
+        raw = int(getattr(self.parent_window, "current_frame", 0) or 0) + 1
+        return max(1, min(total, raw))
+
+    def _on_start_anchor_changed(self):
+        anchor_mode = self.start_anchor_combo.currentData() or StartAnchorMode.ORIGINAL
+        self.start_frame_spin.setEnabled(anchor_mode != StartAnchorMode.ORIGINAL)
+        self.replan_preview()
+
+    def _use_current_frame_for_start(self):
+        current_1based = self._current_frame_1based()
+        self.start_frame_spin.blockSignals(True)
+        self.start_frame_spin.setValue(current_1based)
+        self.start_frame_spin.blockSignals(False)
+
+        if self.start_anchor_combo.currentData() == StartAnchorMode.ORIGINAL:
+            idx = self.start_anchor_combo.findData(StartAnchorMode.FIRST_BOOKMARK)
+            if idx >= 0:
+                self.start_anchor_combo.setCurrentIndex(idx)
+                return
+
+        self.replan_preview()
+
+    def _target_fps(self) -> float:
+        if hasattr(self.parent_window, "get_effective_fps"):
+            return float(self.parent_window.get_effective_fps())
+        if hasattr(self.parent_window, "get_export_fps"):
+            return float(self.parent_window.get_export_fps())
+        return 24.0
+
+    def _target_source_name(self) -> str:
+        if hasattr(self.parent_window, "get_loaded_source_name"):
+            return str(self.parent_window.get_loaded_source_name())
+        return "clip"
+
+    def _sync_document_metadata(self):
+        target_fps = self._target_fps()
+        target_frames = self._target_total_frames()
+        src_fps = self.document.source_fps
+        fps_text = f"{src_fps:g} fps" if src_fps else "unknown fps"
+        src_name = self.document.source_name or os.path.basename(self.filepath)
+        self.source_info_label.setText(
+            f"{src_name} • {len(self.document.bookmarks)} bookmark(s) • "
+            f"{fps_text} • format: {self.document.detected_format.upper()}"
+        )
+        self.target_info_label.setText(
+            f"{self._target_source_name()} • {target_frames} frame(s) • {target_fps:g} fps"
+        )
+
+        recommended = recommend_position_mode(self.document, target_fps)
+        idx = self.position_mode_combo.findData(recommended)
+        if idx >= 0:
+            self.position_mode_combo.blockSignals(True)
+            self.position_mode_combo.setCurrentIndex(idx)
+            self.position_mode_combo.blockSignals(False)
+
+    def _browse_file(self):
+        filepath, _ = QFileDialog.getOpenFileName(
+            self,
+            "Select Bookmark File",
+            os.path.dirname(self.filepath) if self.filepath else "",
+            BOOKMARK_IMPORT_FILTER,
+        )
+        if not filepath:
+            return
+        try:
+            doc = load_bookmarks_file(filepath)
+        except Exception as exc:
+            QMessageBox.critical(self, "Import Error", str(exc))
+            return
+        if not doc.bookmarks:
+            QMessageBox.warning(
+                self, "Import Bookmarks", "No bookmarks were found in the selected file."
+            )
+            return
+        self.filepath = filepath
+        self.filepath_edit.setText(filepath)
+        self.document = doc
+        self._sync_document_metadata()
+        self.replan_preview()
+
+    def replan_preview(self):
+        position_mode = self.position_mode_combo.currentData() or PositionMode.FRAME
+        out_of_range = self.out_of_range_combo.currentData() or OutOfRangePolicy.SKIP
+        collision_policy = (
+            self.collision_combo.currentData() or CollisionPolicy.KEEP_EXISTING
+        )
+        start_anchor = self.start_anchor_combo.currentData() or StartAnchorMode.ORIGINAL
+        start_frame = (
+            self.start_frame_spin.value() - 1
+            if start_anchor != StartAnchorMode.ORIGINAL
+            else None
+        )
+        existing = list(getattr(self.parent_window, "bookmarks", []) or [])
+
+        self.plan = plan_bookmark_import(
+            self.document,
+            existing_bookmarks=existing,
+            target_total_frames=self._target_total_frames(),
+            target_fps=self._target_fps(),
+            position_mode=position_mode,
+            out_of_range=out_of_range,
+            collision_policy=collision_policy,
+            start_frame=start_frame,
+            start_anchor=start_anchor,
+        )
+
+        self.preview_table.setRowCount(len(self.plan.items))
+        for row, item in enumerate(self.plan.items):
+            rec = item.record
+            src_frame_text = f"Frame {rec.frame + 1}" if rec.frame is not None else "—"
+            src_time_text = (
+                rec.timestamp
+                or (f"{rec.seconds:.3f}s" if rec.seconds is not None else "—")
+            )
+            if item.target_frame is not None and item.status not in {
+                "skip_out_of_range",
+                "skip_unresolvable",
+            }:
+                target_text = (
+                    f"Frame {item.target_frame + 1} ({item.target_timestamp})"
+                )
+            elif item.target_frame is not None:
+                target_text = f"Frame {item.target_frame + 1} (OOR)"
+            else:
+                target_text = "—"
+
+            status_label, status_color = self._STATUS_DISPLAY.get(
+                item.status, (item.status, "#e0e0e0")
+            )
+
+            name_item = QTableWidgetItem(rec.name)
+            name_item.setForeground(QColor(rec.color))
+            src_frame_item = QTableWidgetItem(src_frame_text)
+            src_time_item = QTableWidgetItem(src_time_text)
+            target_item = QTableWidgetItem(target_text)
+            status_item = QTableWidgetItem(status_label)
+            status_item.setForeground(QColor(status_color))
+            status_item.setToolTip(item.reason)
+
+            self.preview_table.setItem(row, 0, name_item)
+            self.preview_table.setItem(row, 1, src_frame_item)
+            self.preview_table.setItem(row, 2, src_time_item)
+            self.preview_table.setItem(row, 3, target_item)
+            self.preview_table.setItem(row, 4, status_item)
+
+        ready_count = self.plan.imported_count + self.plan.overwritten_count
+        self.summary_label.setText(
+            f"Will add {self.plan.imported_count}, overwrite {self.plan.overwritten_count}, "
+            f"clamp {self.plan.clamped_count}, skip {self.plan.skipped_count}."
+        )
+        self.import_button.setEnabled(ready_count > 0)
 
 
 class ExportBookmarksVideoDialog(QDialog):
@@ -4710,6 +5354,92 @@ class ExportMp4Dialog(QDialog):
 
 
 class GemmaShotDetectionDialog(QDialog):
+    DEFAULT_MODELS = [
+        ("Gemini 2.5 Flash", "gemini-2.5-flash"),
+        ("Gemini 2.5 Pro", "gemini-2.5-pro"),
+        ("Gemini 2.0 Flash", "gemini-2.0-flash"),
+        ("Gemini 2.0 Flash-Lite", "gemini-2.0-flash-lite"),
+        ("Gemini 2.0 Pro Experimental", "gemini-2.0-pro-exp-02-05"),
+        ("Gemini 1.5 Pro", "gemini-1.5-pro"),
+        ("Gemini 1.5 Flash", "gemini-1.5-flash"),
+        ("Gemini 1.5 Flash-8B", "gemini-1.5-flash-8b"),
+        ("Gemma 2 27B Instruct", "gemma-2-27b-it"),
+        ("Gemma 2 9B Instruct", "gemma-2-9b-it"),
+    ]
+
+    @staticmethod
+    def fetch_gemini_models(api_key: str = "") -> tuple[list[tuple[str, str]], bool]:
+        """
+        Actively retrieves available Gemini/Gemma models from the Google GenAI API.
+        Filters for content generation models, ranks and extracts the top 10.
+        Returns (models_list, is_live_bool).
+        """
+        raw_key = (api_key or "").strip()
+        if not raw_key or raw_key in MainWindow.DUMMY_API_KEYS:
+            return GemmaShotDetectionDialog.DEFAULT_MODELS, False
+
+        try:
+            import re
+            from google import genai
+            client = genai.Client(api_key=raw_key)
+            raw_models = list(client.models.list())
+
+            candidates = []
+            for m in raw_models:
+                name = getattr(m, "name", str(m))
+                model_id = name.split("/")[-1] if "/" in name else name
+                lower_id = model_id.lower()
+
+                # Must be Gemini or Gemma
+                if not ("gemini" in lower_id or "gemma" in lower_id):
+                    continue
+                # Skip non-LLM/non-generation tasks
+                if any(bad in lower_id for bad in [
+                    "embedding", "imagen", "veo", "aqa", "robotics",
+                    "bison", "learnlm", "rerank", "transcription"
+                ]):
+                    continue
+                actions = getattr(m, "supported_actions", None)
+                if actions and "generateContent" not in actions:
+                    continue
+
+                display_name = (getattr(m, "display_name", "") or "").strip()
+                if not display_name:
+                    display_name = model_id.replace("-", " ").title()
+
+                candidates.append((display_name, model_id))
+
+            if not candidates:
+                return GemmaShotDetectionDialog.DEFAULT_MODELS, False
+
+            # Ranking function: prefer newer versions, canonical names over dated snapshots
+            def _score_model(item):
+                disp, mid = item
+                low = mid.lower()
+                v_match = re.search(r"(\d+(?:\.\d+)?)", low)
+                version = float(v_match.group(1)) if v_match else 0.0
+                is_dated = 1 if re.search(r"-\d{3,4}$", low) else 0
+                is_gemini = 1 if "gemini" in low else 0
+                is_flash = 1 if "flash" in low else 0
+                return (is_gemini, version, is_flash, -is_dated)
+
+            candidates.sort(key=_score_model, reverse=True)
+
+            # Deduplicate numbered snapshot suffixes when the base model is present
+            deduped = []
+            seen_bases = set()
+            for disp, mid in candidates:
+                base = re.sub(r"-\d{3,4}$", "", mid)
+                if base in seen_bases:
+                    continue
+                seen_bases.add(base)
+                deduped.append((disp, mid))
+
+            top_10 = deduped[:10]
+            return top_10 if top_10 else GemmaShotDetectionDialog.DEFAULT_MODELS, True
+        except Exception:
+            return GemmaShotDetectionDialog.DEFAULT_MODELS, False
+
     def __init__(self, parent):
         super().__init__(parent)
         self.parent_window = parent
@@ -4753,18 +5483,24 @@ class GemmaShotDetectionDialog(QDialog):
         layout.addRow("Google API Key:", api_layout)
 
         self.model_combo = QComboBox()
-        self.model_combo.addItem("Gemini 3 Flash", "gemini-3-flash-preview")
-        self.model_combo.addItem("Gemini 3.1 Flash-Lite", "gemini-3.1-flash-lite-preview")
-        self.model_combo.addItem("Gemma 4 31B Instruct", "gemma-4-31b-it")
-        self.model_combo.addItem("Gemma 4 26B A4B Instruct", "gemma-4-26b-a4b-it")
-        model_hint = QLabel(
-            "Supported local options include Gemini 3 Flash, Gemini 3.1 Flash-Lite, and Gemma 4 models."
+        self.refresh_models_btn = QPushButton("↻ Refresh")
+        self.refresh_models_btn.setFixedWidth(80)
+        self.refresh_models_btn.setToolTip("Actively query Google API for the latest top 10 models")
+        self.refresh_models_btn.clicked.connect(self.refresh_models)
+        self.api_key.returnPressed.connect(self.refresh_models)
+
+        model_row = QHBoxLayout()
+        model_row.addWidget(self.model_combo, 1)
+        model_row.addWidget(self.refresh_models_btn)
+
+        self.model_hint = QLabel(
+            "Top 10 available Gemini models. Click ↻ Refresh to query Google API with your API key."
         )
-        model_hint.setWordWrap(True)
-        model_hint.setStyleSheet("color: gray; font-size: 10px;")
+        self.model_hint.setWordWrap(True)
+        self.model_hint.setStyleSheet("color: gray; font-size: 10px;")
         model_layout = QVBoxLayout()
-        model_layout.addWidget(self.model_combo)
-        model_layout.addWidget(model_hint)
+        model_layout.addLayout(model_row)
+        model_layout.addWidget(self.model_hint)
         layout.addRow("Model:", model_layout)
 
         self.start_spinbox = QSpinBox()
@@ -4803,8 +5539,36 @@ class GemmaShotDetectionDialog(QDialog):
         buttons.rejected.connect(self.reject)
         layout.addRow(buttons)
 
+        self.refresh_models()
         self.update_bookmark_options()
         self.update_plan_preview()
+
+    def refresh_models(self):
+        entered_key = self.api_key.text().strip()
+        key = entered_key or self.parent_window.get_configured_google_api_key()
+        current_selection = self.model_combo.currentData()
+
+        models, is_live = self.fetch_gemini_models(key)
+        self.model_combo.clear()
+
+        selected_index = 0
+        for i, (disp, mid) in enumerate(models):
+            self.model_combo.addItem(disp, mid)
+            if mid == current_selection:
+                selected_index = i
+
+        self.model_combo.setCurrentIndex(selected_index)
+
+        if is_live:
+            self.model_hint.setText(f"Actively retrieved top {len(models)} latest Gemini models from API.")
+            self.model_hint.setStyleSheet("color: #00ff88; font-size: 10px;")
+        else:
+            if entered_key and not self.parent_window.is_dummy_google_api_key(entered_key):
+                self.model_hint.setText("Could not query API with provided key. Showing standard Gemini models.")
+                self.model_hint.setStyleSheet("color: #ffaa00; font-size: 10px;")
+            else:
+                self.model_hint.setText("Showing standard Gemini models. Enter an API key and click ↻ Refresh to fetch live models.")
+                self.model_hint.setStyleSheet("color: gray; font-size: 10px;")
 
     def browse_output_folder(self):
         folder = QFileDialog.getExistingDirectory(self, "Select Output Folder")

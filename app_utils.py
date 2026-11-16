@@ -127,9 +127,18 @@ def build_bookmark_export_filename(prefix, bookmark_index, frame_num, bookmark_n
     )
 
 
-def build_bookmark_video_export_filename(prefix, extension):
+def build_bookmark_collection_filename(prefix, extension):
+    """Build a predictable filename for collection-level bookmark exports."""
     prefix = sanitize_filename_part(prefix)
     return f"{prefix}_bookmarks{extension}"
+
+
+def build_bookmark_video_export_filename(prefix, extension):
+    return build_bookmark_collection_filename(prefix, extension)
+
+
+def build_bookmark_data_export_filename(prefix, extension):
+    return build_bookmark_collection_filename(prefix, extension)
 
 
 def build_shot_grid_filename(

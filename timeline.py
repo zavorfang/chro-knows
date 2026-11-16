@@ -129,6 +129,7 @@ class TimelineWidget(QWidget):
         
         frame_offset = 50
         
+        visible_rect = event.rect()
         sorted_frames = sorted(self.thumbnails.keys())
         for i, frame in enumerate(sorted_frames):
             x = frame_offset + frame * self.frame_width
@@ -136,23 +137,23 @@ class TimelineWidget(QWidget):
             # Calculate width to the next thumbnail, but cap it so the last thumbnail doesn't stretch infinitely if total_frames is very large
             width = min((next_frame - frame) * self.frame_width, self.thumbnail_size * 5)
             
+            if x + width < visible_rect.left() or x > visible_rect.right():
+                continue
+
             thumb = self.thumbnails[frame]
-            
-            painter.save()
             target_h = max(10, self.height() - 25)
-            clip_rect = QRect(int(x), 0, int(width), target_h)
-            painter.setClipRect(clip_rect)
+            max_w = max(1, int(width))
             
+            # Miniature image scaled down to fit without cropping, using fast transformation for performance
             thumb_scaled = thumb.scaled(
-                int(width), target_h,
-                Qt.AspectRatioMode.KeepAspectRatioByExpanding,
-                Qt.TransformationMode.SmoothTransformation
+                max_w, target_h,
+                Qt.AspectRatioMode.KeepAspectRatio,
+                Qt.TransformationMode.FastTransformation
             )
             
-            tx = x + (width - thumb_scaled.width()) // 2
-            ty = max(0, (target_h - thumb_scaled.height()) // 2)
+            tx = x + (width - thumb_scaled.width()) / 2
+            ty = max(0, (target_h - thumb_scaled.height()) / 2)
             painter.drawPixmap(int(tx), int(ty), thumb_scaled)
-            painter.restore()
 
         for frame in range(self.total_frames):
             x = frame_offset + frame * self.frame_width

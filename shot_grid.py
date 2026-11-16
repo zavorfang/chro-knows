@@ -114,13 +114,6 @@ def samples_at_interval(length: int, interval: int) -> int:
     return (length - 1) // interval + 1
 
 
-def _half_up(x: float) -> int:
-    # Round half up (not Python's banker's round()) so results are identical on
-    # every platform and .5 always goes to the later frame. It is monotonic, so
-    # frames that are >= 1 apart before rounding stay distinct.
-    return int(math.floor(x + 0.5))
-
-
 def allowed_cell_counts(
     max_dim: int = DEFAULT_MAX_DIM, rectangular: bool = False
 ) -> list[int]:
@@ -201,17 +194,11 @@ def select_frames(shot: Shot, interval: int, total: int) -> tuple[int, ...]:
     if total > length:
         raise ValueError("cannot select more frames than the shot contains")
 
-    n = samples_at_interval(length, interval)
-    if total <= n:
-        # stay on the 'every Nth frame' lattice; thin it evenly if needed
-        if total == 1:
-            idx = [(n - 1) // 2]                     # middle sample
-        else:
-            idx = [_half_up(k * (n - 1) / (total - 1)) for k in range(total)]
-        return tuple(shot.start + i * interval for i in idx)
-    # need more frames than the interval gives: spread evenly over the shot
+    if total == 1:
+        return (shot.start + (shot.length - 1) // 2,)
+    span, steps = shot.length - 1, total - 1
     return tuple(
-        shot.start + _half_up(k * (length - 1) / (total - 1)) for k in range(total)
+        shot.start + (2 * k * span + steps) // (2 * steps) for k in range(total)
     )
 
 

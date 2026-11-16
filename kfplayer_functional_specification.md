@@ -583,7 +583,7 @@ Each bookmark starts a shot; a shot ends one frame before the next bookmark. The
 - **Trim** never adds frames; it picks the closest full layout at or below the sample count.
 - **Fill** never drops frames; it picks the fewest grids that hold every sample.
 - Layouts are always completely filled: no black/empty cells. Long shots split into equal grids in time order.
-- Frames stay on the every-Nth lattice when trimming; when filling, they spread evenly across the shot.
+- Selected frames always start on the shot's first frame and end on its last frame, with the remaining panels spaced evenly across the shot (neighbouring gaps differ by at most one frame; a single-cell grid takes the middle frame).
 
 #### Shots table
 Live columns: checkbox, shot number, bookmark name, first–last frame (1-based), length, samples at the interval, planned layout (for example `2 × 4×4`) and real spacing. Unchecking a row skips it. Double-clicking seeks the player to the shot start. A summary shows `{shots} shots → {images} images, {empty} empty cell(s)` and flags shots shorter than the interval.
